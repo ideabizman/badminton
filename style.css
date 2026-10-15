@@ -44,9 +44,20 @@ body {
 
 .steps { background: var(--card); border-bottom: 1px solid var(--line); }
 .steps ol { display: flex; margin: 0 auto; padding: 0 16px; list-style: none; max-width: 960px; }
-.steps li { flex: 1; text-align: center; padding: 8px 4px; color: var(--muted); border-bottom: 3px solid transparent; }
-.steps li.active { color: var(--primary); font-weight: bold; border-bottom-color: var(--primary); }
-.steps li.done { color: var(--text); }
+.steps li { flex: 1; }
+.steps li button {
+  width: 100%; padding: 10px 4px; border: none; border-bottom: 3px solid transparent; border-radius: 0;
+  background: transparent; color: var(--muted);
+}
+.steps li button.active { color: var(--primary); font-weight: bold; border-bottom-color: var(--primary); }
+.steps li button.done { color: var(--text); }
+.steps li button.locked { color: #b8c0c8; cursor: not-allowed; }
+.steps li button:hover:not(.locked):not(.active) { background: #f2f5fa; }
+.step-msg { max-width: 960px; margin: 0 auto; padding: 0 16px 8px; color: var(--warn); font-size: 0.9rem; text-align: center; }
+.step-msg:empty { display: none; }
+.soon { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.soon small { color: var(--muted); }
+#kakao-url { flex: 1; min-width: 200px; }
 
 main { max-width: 960px; margin: 0 auto; padding: 16px; }
 .view { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }

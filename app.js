@@ -11,6 +11,10 @@
   var COLUMN_ALIASES = { name: ["이름", "성명"], gender: ["성별"], grade: ["급수", "출전급수"] };
   var MIN_PLAYERS = 8;
   var STEP_BUDGET_MS = 40;   // 한 번에 계산하는 시간. 그 사이에 화면을 다시 그린다
+  // 화면 수정일 (12절: 다시 올린 뒤 새 화면이 보이는지 확인용). 생성 결과와 관계없으므로 SCHEDULER_VERSION과 따로 둔다.
+  // 바꿀 때 index.html의 ?v= 날짜도 함께 바꾼다
+  var UI_BUILD = "2026-10-15";
+  var STALE_MSG = "명단·설정이 바뀌었습니다. [다시 만들기]를 눌러야 반영됩니다";
 
   var state = {
     roster: [],             // [{name, gender, grade}] (입력 그대로, 정리는 normalize에서)
@@ -55,16 +59,95 @@
 
   // ── 화면 전환 ───────────────────────────────────────────
   var VIEWS = ["home", "roster", "settings", "result"];
+  var currentView = "home";
 
   function show(view) {
+    currentView = view;
     VIEWS.forEach(function (v) { $("view-" + v).hidden = v !== view; });
-    var idx = VIEWS.indexOf(view);
-    document.querySelectorAll(".steps li").forEach(function (li) {
-      var i = VIEWS.indexOf(li.getAttribute("data-step"));
-      li.classList.toggle("active", i === idx);
-      li.classList.toggle("done", i < idx);
-    });
+    if (view === "result") updateStale();
+    refreshSteps();
     window.scrollTo(0, 0);
+  }
+
+  // ── 진행 표시를 눌러 단계 이동 (8절, W4) ─────────────────
+  function rosterStatus() {
+    var checks = validate(state.roster);
+    var n = 0, warn = 0;
+    checks.forEach(function (c) { if (!c.blank) n += 1; if (c.msgs.length) warn += 1; });
+    return { n: n, warn: warn, ok: warn === 0 && n >= MIN_PLAYERS };
+  }
+
+  // 단계마다 누를 수 없으면 그 이유, 누를 수 있으면 ""
+  function stepLock(step) {
+    if (state.running) return "대진을 찾는 중입니다. 끝나거나 [멈추기]를 누른 뒤 옮길 수 있습니다";
+    if (step === "settings") {
+      var st = rosterStatus();
+      if (!st.ok) return "명단을 먼저 완성해 주세요: 8명 이상, ⚠ 0개 (지금 " + st.n + "명, ⚠ " + st.warn + "개)";
+    }
+    if (step === "result" && !state.result) return "아직 만든 대진표가 없습니다. ② 설정에서 [대진 만들기]를 눌러 주세요";
+    return "";
+  }
+
+  // 명단을 고치거나 찾기가 끝나면 다시 그린다. 그때 지난 이유 줄은 지운다
+  function refreshSteps() {
+    $("step-msg").textContent = "";
+    var idx = VIEWS.indexOf(currentView);
+    document.querySelectorAll(".steps [data-step]").forEach(function (b) {
+      var step = b.getAttribute("data-step");
+      var i = VIEWS.indexOf(step);
+      var locked = i !== idx && !!stepLock(step);   // 지금 보고 있는 단계는 흐리게 하지 않는다
+      b.classList.toggle("active", i === idx);
+      b.classList.toggle("done", i < idx);
+      b.classList.toggle("locked", locked);
+      b.setAttribute("aria-disabled", locked ? "true" : "false");
+      if (i === idx) b.setAttribute("aria-current", "step"); else b.removeAttribute("aria-current");
+    });
+  }
+
+  function goStep(step) {
+    var why = stepLock(step);
+    if (why) { $("step-msg").textContent = why; return; }
+    if (step === currentView) return;
+    if (step === "roster") { renderRoster(); renderReplayNotice(); show("roster"); }
+    else if (step === "settings") goSettings();
+    else if (step === "result") show("result");
+  }
+
+  // [다음]과 진행 표시 ②가 같은 길로 들어간다. 빈 줄을 정리하고 지난 명단을 저장한다
+  function goSettings() {
+    var players = validPlayers();
+    state.roster = players;
+    var saved = saveLast(players);
+    enterSettings();
+    if (!saved) $("settings-error").textContent = "이 브라우저에서는 기억할 수 없음 (지난 명단을 저장하지 못했습니다).";
+  }
+
+  // ── 결과가 지금 명단·설정과 맞는지 (8절, W4) ──────────────
+  function snapshot(roster, s) {
+    return JSON.stringify({
+      roster: roster.map(function (p) { return [p.name, p.gender, p.grade]; }),
+      settings: [s.date, s.start, s.minutes, s.courts, s.games, s.seed]
+    });
+  }
+
+  function currentSnapshot() {
+    var rs = readSettings();
+    if (rs.errors.length) return "(설정 오류)";
+    return snapshot(Scheduler.sortRoster(validPlayers()), rs.s);
+  }
+
+  function isStale() {
+    return !!state.result && currentSnapshot() !== state.result.snapshot;
+  }
+
+  function updateStale() {
+    $("result-stale").hidden = !isStale();
+  }
+
+  // 낡은 결과를 저장·공유하기 전에 묻는다. 계속하면 true
+  function confirmIfStale(what) {
+    if (!isStale()) return true;
+    return window.confirm(STALE_MSG + "\n\n이전 결과로 " + what + "할까요?");
   }
 
   // ── 명단: 정리와 확인 (4절) ─────────────────────────────
@@ -159,6 +242,7 @@
     if (players.length < MIN_PLAYERS) reasons.push("8명 이상이어야 합니다 (지금 " + players.length + "명). 연속 경기 없이 돌아가려면 1코트라도 8명이 필요합니다.");
     $("roster-next").disabled = reasons.length > 0;
     $("roster-block").textContent = reasons.join(" ");
+    refreshSteps();
   }
 
   function renderSummary(players, warnCount) {
@@ -512,6 +596,7 @@
 
     function finish(res) {
       state.running = null;
+      refreshSteps();
       $("run-status").hidden = true;
       refreshSettings();
       if (!res) return;
@@ -520,29 +605,27 @@
       show("result");
     }
 
-    if (forceNewSeed) show("settings");
+    if (currentView !== "settings") show("settings");   // 진행 상황은 ② 화면에 보인다
+    else refreshSteps();
     setTimeout(tick, 0);
   }
 
+  // 안내 내용은 advice.js가 고른다 (5.1: 생성 코드와 분리)
   function showFailure(res, roster, s) {
+    var adv = Advice.forFailure(roster, s, res);
     var box = $("run-fail");
     clear(box);
-    box.appendChild(el("b", { text: "규칙을 완화하지 않아 만들 수 없었습니다." }));
+    box.appendChild(el("b", { text: adv.title }));
+    box.appendChild(el("p", { text: adv.intro.text }));
     var ul = el("ul");
-    if (res.parityFail) {
-      var fewerTxt = res.fewer.map(function (i) { return roster[i].name + "(" + roster[i].gender + ")"; }).join(", ");
-      box.appendChild(el("p", { text: "남자 또는 여자의 출전 횟수 합이 홀수라 짝을 맞출 수 없습니다. 한 경기에 남자·여자는 0·2·4명씩 들어가기 때문입니다." +
-        (fewerTxt ? " 이 대진 번호로는 1경기 적게 배정되는 사람이 " + fewerTxt + "입니다." : "") }));
-      if (res.fewer.length) ul.appendChild(el("li", { text: "대진 번호를 비워 새 번호로 해 보세요 (1경기 적게 배정되는 사람이 바뀝니다)." }));
-    } else {
-      box.appendChild(el("p", { text: res.tries + "번 시도했지만 모든 규칙(연속 경기 없음, 같은 파트너 반복 없음, 같은 종류끼리, 급수 합 차이 1 이하)을 함께 지키는 대진을 찾지 못했습니다." }));
-    }
-    Scheduler.checkFeasibility(roster, s.courts, s.games).forEach(function (w) { ul.appendChild(el("li", { text: w.reason + " → " + w.fix })); });
-    ul.appendChild(el("li", { text: "코트 수를 줄여 보세요 (권장 " + Scheduler.recommendedCourts(roster.length) + "면)." }));
-    ul.appendChild(el("li", { text: "1인당 경기 수를 줄여 보세요." }));
-    ul.appendChild(el("li", { text: "한 성별이나 한 급수에 사람이 아주 적으면 맞출 상대가 없을 수 있습니다. 명단을 확인해 보세요." }));
+    adv.items.forEach(function (it) { ul.appendChild(el("li", { "data-kind": it.kind, text: it.text })); });
     box.appendChild(el("p", { text: "바꿔 볼 항목:" }));
     box.appendChild(ul);
+    if (adv.offerNewSeed) {
+      var again = el("button", { type: "button", id: "fail-new-seed", text: "새 번호로 다시 만들기" });
+      again.addEventListener("click", function () { runGenerate(true); });
+      box.appendChild(el("div", { class: "row" }, [again]));
+    }
     box.hidden = false;
   }
 
@@ -572,7 +655,8 @@
       repeatOpp: res.repeatOpp,
       found: res.found,
       tries: res.tries,
-      check: Checker.check(roster, rows)
+      check: Checker.check(roster, rows),
+      snapshot: snapshot(roster, s)          // 나중에 명단·설정이 바뀌었는지 비교 (W4)
     };
     renderResult();
   }
@@ -841,31 +925,87 @@
     return wb;
   }
 
+  function download(blob, name) {
+    var url = URL.createObjectURL(blob);
+    var a = el("a", { href: url, download: name });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+  }
+
   function saveExcel() {
     var R = state.result;
     $("result-error").textContent = "";
+    if (!confirmIfStale("저장")) return;
     if (typeof ExcelJS === "undefined") {
       $("result-error").textContent = "Excel 기능을 불러오지 못했습니다. lib 폴더가 index.html 옆에 있는지 확인해 주세요.";
       return;
     }
     var name = "대진표_" + R.settings.date.replace(/-/g, "") + "_" + R.seed + ".xlsx";
     buildWorkbook(R).xlsx.writeBuffer().then(function (buf) {
-      var blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      var url = URL.createObjectURL(blob);
-      var a = el("a", { href: url, download: name });
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+      download(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
     }).catch(function (e) {
       $("result-error").textContent = "Excel 파일을 만들지 못했습니다. " + (e && e.message ? e.message : "");
     });
   }
 
+  // ── 이미지 공유 (8절, W4) ──────────────────────────────
+  // 휴대폰이 파일 공유를 지원하면 공유 창, 아니면 PNG 내려받기
+  function shareImage() {
+    var R = state.result;
+    $("result-error").textContent = "";
+    if (!confirmIfStale("공유")) return;
+    var name = ScheduleImage.fileName(R);
+    ScheduleImage.toPngBlob(R).then(function (out) {
+      var file = null;
+      try { file = new File([out.blob], name, { type: "image/png" }); } catch (e) { file = null; }
+      var canShare = false;
+      try { canShare = !!(file && navigator.canShare && navigator.share && navigator.canShare({ files: [file] })); } catch (e) { canShare = false; }
+      if (!canShare) { download(out.blob, name); return; }
+      return navigator.share({ files: [file], title: "배드민턴 대진표" }).catch(function (e) {
+        if (e && e.name === "AbortError") return;      // 사용자가 공유 창을 닫음
+        download(out.blob, name);                        // 그 밖의 이유로 공유가 안 되면 내려받기
+      });
+    }).catch(function (e) {
+      $("result-error").textContent = "이미지를 만들지 못했습니다. " + (e && e.message ? e.message : "");
+    });
+  }
+
+  // ── 카톡 안 브라우저 (4.1, W4) ─────────────────────────
+  // 브라우저 정보는 이 기기 안에서 읽기만 한다
+  function setupKakaoNotice() {
+    if (!/KAKAOTALK/i.test(navigator.userAgent || "")) return;
+    $("kakao-url").value = String(location.href).split(/[?#]/)[0];
+    $("kakao-notice").hidden = false;
+  }
+
+  function copyUrl() {
+    var input = $("kakao-url"), msg = $("kakao-copy-msg");
+    var done = "주소를 복사했습니다. 삼성 인터넷·Chrome 주소창에 붙여 넣어 주세요.";
+    function fallback() {
+      var ok = false;
+      try { input.focus(); input.select(); ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      msg.textContent = ok ? done : "주소 칸을 길게 눌러 복사해 주세요.";
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(input.value).then(function () { msg.textContent = done; }, fallback);
+    } else {
+      fallback();
+    }
+  }
+
   // ── 연결 ───────────────────────────────────────────────
   function init() {
     $("app-version").textContent = Scheduler.SCHEDULER_VERSION;
+    $("build-info").textContent = "앱 버전 " + Scheduler.SCHEDULER_VERSION + " · 화면 수정 " + UI_BUILD;
     renderHome();
+    setupKakaoNotice();
+    $("kakao-copy").addEventListener("click", copyUrl);
+
+    document.querySelectorAll(".steps [data-step]").forEach(function (b) {
+      b.addEventListener("click", function () { goStep(b.getAttribute("data-step")); });
+    });
 
     $("home-new").addEventListener("click", function () {
       state.replaySeed = "";
@@ -918,13 +1058,7 @@
       renderRoster();
     });
     $("roster-back").addEventListener("click", function () { renderHome(); show("home"); });
-    $("roster-next").addEventListener("click", function () {
-      var players = validPlayers();
-      state.roster = players;                        // 빈 줄 정리
-      var saved = saveLast(players);
-      enterSettings();
-      if (!saved) $("settings-error").textContent = "이 브라우저에서는 기억할 수 없음 (지난 명단을 저장하지 못했습니다).";
-    });
+    $("roster-next").addEventListener("click", goSettings);
 
     ["set-date", "set-start", "set-minutes", "set-courts", "set-games", "set-seed"].forEach(function (id) {
       $(id).addEventListener("input", refreshSettings);
@@ -941,6 +1075,13 @@
     });
     $("mine-name").addEventListener("change", function () { renderMine($("mine-name").value); });
     $("result-excel").addEventListener("click", saveExcel);
+    $("result-image").addEventListener("click", shareImage);
+    $("stale-rerun").addEventListener("click", function () {
+      var why = stepLock("settings");
+      if (why) { $("result-error").textContent = why; return; }   // 명단이 덜 고쳐졌으면 다시 만들 수 없다
+      if (readSettings().errors.length) { goSettings(); return; }   // 설정 오류는 ② 화면에서 보인다
+      runGenerate(false);
+    });
     $("result-again").addEventListener("click", function () { runGenerate(true); });
     $("result-settings").addEventListener("click", function () { refreshSettings(); show("settings"); });
 
