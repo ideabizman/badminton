@@ -57,7 +57,7 @@ body {
 .step-msg:empty { display: none; }
 .soon { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
 .soon small { color: var(--muted); }
-#kakao-url { flex: 1; min-width: 200px; }
+.kakao-url { flex: 1; min-width: 200px; }
 
 main { max-width: 960px; margin: 0 auto; padding: 16px; }
 .view { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }

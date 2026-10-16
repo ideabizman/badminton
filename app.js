@@ -13,8 +13,10 @@
   var STEP_BUDGET_MS = 40;   // 한 번에 계산하는 시간. 그 사이에 화면을 다시 그린다
   // 화면 수정일 (12절: 다시 올린 뒤 새 화면이 보이는지 확인용). 생성 결과와 관계없으므로 SCHEDULER_VERSION과 따로 둔다.
   // 바꿀 때 index.html의 ?v= 날짜도 함께 바꾼다
-  var UI_BUILD = "2026-10-15";
+  var UI_BUILD = "2026-10-16";
   var STALE_MSG = "명단·설정이 바뀌었습니다. [다시 만들기]를 눌러야 반영됩니다";
+  // 카톡 안 브라우저 (4.1). 브라우저 정보는 이 기기 안에서 읽기만 한다
+  var IN_KAKAO = /KAKAOTALK/i.test(navigator.userAgent || "");
 
   var state = {
     roster: [],             // [{name, gender, grade}] (입력 그대로, 정리는 normalize에서)
@@ -630,15 +632,25 @@
   }
 
   // ── 결과 (8절 ③) ───────────────────────────────────────
+  // 8.1 (개정 6): 화면과 이미지에서만 혼복 팀은 남자를 먼저 보인다.
+  // t1·t2(생성 순서)는 그대로 두고 Excel·자기 점검은 그것을 쓴다
+  function shownTeam(team, type, genderOf) {
+    if (type !== "혼복" || genderOf[team[0]] === "남") return team.slice();
+    return [team[1], team[0]];
+  }
+
   function buildResult(res, roster, s) {
     var score = Scheduler.GRADE_SCORE;
+    var genderOf = {};
+    roster.forEach(function (p) { genderOf[p.name] = p.gender; });
     var rows = res.matches.map(function (m, i) {
       var t1 = m.t1.map(function (p) { return roster[p].name; });
       var t2 = m.t2.map(function (p) { return roster[p].name; });
       var s1 = m.t1.reduce(function (a, p) { return a + score[roster[p].grade]; }, 0);
       var s2 = m.t2.reduce(function (a, p) { return a + score[roster[p].grade]; }, 0);
       return { no: i + 1, slot: m.slot, time: Scheduler.slotTime(s.start, s.minutes, m.slot), court: m.court,
-        t1: t1, t2: t2, type: m.type, s1: s1, s2: s2 };
+        t1: t1, t2: t2, type: m.type, s1: s1, s2: s2,
+        show1: shownTeam(t1, m.type, genderOf), show2: shownTeam(t2, m.type, genderOf) };   // 화면·이미지용
     });
     var games = {};
     roster.forEach(function (p) { games[p.name] = 0; });
@@ -700,6 +712,7 @@
     renderMineOptions();
     setResultTab("grid");
     $("result-error").textContent = "";
+    $("kakao-result").hidden = true;
   }
 
   function renderGrid() {
@@ -720,9 +733,9 @@
         if (m) {
           tr.appendChild(el("td", { class: "match t-" + m.type }, [
             el("div", { class: "kind", text: m.type }),
-            el("div", { text: m.t1.join(" · ") }),
+            el("div", { text: m.show1.join(" · ") }),
             el("div", { class: "vs", text: "vs" }),
-            el("div", { text: m.t2.join(" · ") })
+            el("div", { text: m.show2.join(" · ") })
           ]));
         } else {
           tr.appendChild(el("td", { class: "empty", text: "(빈 코트)" }));
@@ -762,7 +775,7 @@
     t.appendChild(el("tr", null, ["시간", "코트", "파트너", "상대", "종류"].map(function (h) { return el("th", { text: h }); })));
     mine.forEach(function (r) {
       var myTeam = r.t1.indexOf(name) >= 0 ? r.t1 : r.t2;
-      var other = myTeam === r.t1 ? r.t2 : r.t1;
+      var other = myTeam === r.t1 ? r.show2 : r.show1;
       var partner = myTeam.filter(function (p) { return p !== name; })[0];
       t.appendChild(el("tr", null, [
         el("td", { text: r.time }), el("td", { text: String(r.court) }),
@@ -937,6 +950,7 @@
   function saveExcel() {
     var R = state.result;
     $("result-error").textContent = "";
+    if (IN_KAKAO) { showKakaoResult(); return; }   // 카톡 안에서는 저장을 시도하지 않는다 (4.1 개정 6 ④)
     if (!confirmIfStale("저장")) return;
     if (typeof ExcelJS === "undefined") {
       $("result-error").textContent = "Excel 기능을 불러오지 못했습니다. lib 폴더가 index.html 옆에 있는지 확인해 주세요.";
@@ -955,6 +969,7 @@
   function shareImage() {
     var R = state.result;
     $("result-error").textContent = "";
+    if (IN_KAKAO) { showKakaoResult(); return; }   // 카톡 안에서는 공유를 시도하지 않는다 (4.1 개정 6 ④)
     if (!confirmIfStale("공유")) return;
     var name = ScheduleImage.fileName(R);
     ScheduleImage.toPngBlob(R).then(function (out) {
@@ -972,16 +987,21 @@
     });
   }
 
-  // ── 카톡 안 브라우저 (4.1, W4) ─────────────────────────
-  // 브라우저 정보는 이 기기 안에서 읽기만 한다
+  // ── 카톡 안 브라우저 (4.1, W4 · 개정 6) ──────────────────
+  // ① 명단 화면 첫머리에 안내. 결과 화면의 안내는 [Excel 저장]·[이미지 공유]를 누를 때 보인다
   function setupKakaoNotice() {
-    if (!/KAKAOTALK/i.test(navigator.userAgent || "")) return;
-    $("kakao-url").value = String(location.href).split(/[?#]/)[0];
+    if (!IN_KAKAO) return;
+    var url = String(location.href).split(/[?#]/)[0];
+    $("kakao-url").value = url;
+    $("kakao-result-url").value = url;
     $("kakao-notice").hidden = false;
   }
 
-  function copyUrl() {
-    var input = $("kakao-url"), msg = $("kakao-copy-msg");
+  function showKakaoResult() {
+    $("kakao-result").hidden = false;
+  }
+
+  function copyUrl(input, msg) {
     var done = "주소를 복사했습니다. 삼성 인터넷·Chrome 주소창에 붙여 넣어 주세요.";
     function fallback() {
       var ok = false;
@@ -1001,7 +1021,8 @@
     $("build-info").textContent = "앱 버전 " + Scheduler.SCHEDULER_VERSION + " · 화면 수정 " + UI_BUILD;
     renderHome();
     setupKakaoNotice();
-    $("kakao-copy").addEventListener("click", copyUrl);
+    $("kakao-copy").addEventListener("click", function () { copyUrl($("kakao-url"), $("kakao-copy-msg")); });
+    $("kakao-result-copy").addEventListener("click", function () { copyUrl($("kakao-result-url"), $("kakao-result-msg")); });
 
     document.querySelectorAll(".steps [data-step]").forEach(function (b) {
       b.addEventListener("click", function () { goStep(b.getAttribute("data-step")); });

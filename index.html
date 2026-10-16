@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>배드민턴 대진표 만들기</title>
-  <link rel="stylesheet" href="style.css?v=2026-10-15">
+  <link rel="stylesheet" href="style.css?v=2026-10-16">
 </head>
 <body>
   <header class="top">
@@ -44,6 +44,15 @@
 
     <!-- ① 명단 -->
     <section id="view-roster" class="view" hidden>
+      <!-- 카톡 안 브라우저에서만 보인다 (4.1 개정 6: 화면 첫머리) -->
+      <div class="warn-box" id="kakao-notice" hidden>
+        <p><b>카톡 안에서는 Excel 저장과 이미지 공유가 되지 않습니다.</b> 대진표를 만들어 저장·공유하려면 삼성 인터넷·Chrome으로 열어 주세요.</p>
+        <div class="row">
+          <input id="kakao-url" class="kakao-url" readonly aria-label="이 화면의 주소">
+          <button type="button" id="kakao-copy">주소 복사</button>
+        </div>
+        <p class="hint" id="kakao-copy-msg"></p>
+      </div>
       <div class="notice" id="replay-notice" hidden></div>
       <div class="tabs" role="tablist">
         <button type="button" role="tab" data-method="direct" class="active">직접 입력</button>
@@ -51,14 +60,6 @@
 
       <div class="method" id="method-excel" hidden>
         <p>이름·성별·급수 열이 있는 Excel 파일(.xlsx)을 고르세요. 첫 번째 시트의 첫 줄을 열 이름으로 읽습니다.</p>
-        <div class="warn-box" id="kakao-notice" hidden>
-          <p><b>카톡 안에서는 Excel 파일이 안 보일 수 있습니다. 삼성 인터넷·Chrome으로 열어 주세요.</b></p>
-          <div class="row">
-            <input id="kakao-url" readonly aria-label="이 화면의 주소">
-            <button type="button" id="kakao-copy">주소 복사</button>
-          </div>
-          <p class="hint" id="kakao-copy-msg"></p>
-        </div>
         <input type="file" id="excel-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
         <p class="error" id="excel-error"></p>
         <div id="column-picker" class="box" hidden>
@@ -153,6 +154,15 @@
         <button type="button" id="result-again">다시 만들기 (새 번호)</button>
         <button type="button" id="result-settings">설정으로</button>
       </div>
+      <!-- 카톡 안에서 [Excel 저장]·[이미지 공유]를 누르면 저장·공유 대신 보인다 (4.1 개정 6 ④) -->
+      <div class="warn-box" id="kakao-result" hidden>
+        <p><b>카톡 안에서는 Excel 저장과 이미지 공유가 되지 않습니다.</b> 대진표를 만들어 저장·공유하려면 삼성 인터넷·Chrome으로 열어 주세요.</p>
+        <div class="row">
+          <input id="kakao-result-url" class="kakao-url" readonly aria-label="이 화면의 주소">
+          <button type="button" id="kakao-result-copy">주소 복사</button>
+        </div>
+        <p class="hint" id="kakao-result-msg"></p>
+      </div>
       <p class="error" id="result-error"></p>
     </section>
   </main>
@@ -162,11 +172,11 @@
 
   <!-- 순서대로 불러온다 (file://에서도 동작하도록 모듈을 쓰지 않음)
        ?v= 는 다시 올렸을 때 휴대폰이 옛 파일을 쓰지 않게 하려는 것 (12절). 올릴 때마다 app.js의 UI_BUILD와 같은 날짜로 바꾼다 -->
-  <script src="lib/exceljs.min.js?v=2026-10-15"></script>
-  <script src="scheduler.js?v=2026-10-15"></script>
-  <script src="checker.js?v=2026-10-15"></script>
-  <script src="advice.js?v=2026-10-15"></script>
-  <script src="image.js?v=2026-10-15"></script>
-  <script src="app.js?v=2026-10-15"></script>
+  <script src="lib/exceljs.min.js?v=2026-10-16"></script>
+  <script src="scheduler.js?v=2026-10-16"></script>
+  <script src="checker.js?v=2026-10-16"></script>
+  <script src="advice.js?v=2026-10-16"></script>
+  <script src="image.js?v=2026-10-16"></script>
+  <script src="app.js?v=2026-10-16"></script>
 </body>
 </html>

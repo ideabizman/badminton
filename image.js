@@ -55,7 +55,7 @@
     if (stats && ctx.measureText(text).width > maxW) stats.clipped += 1;
   }
 
-  // R: app.js의 결과 객체 (settings, seed, version, roster, rows, plan, fewer)
+  // R: app.js의 결과 객체 (settings, seed, version, roster, rows(show1·show2 포함), plan, fewer)
   function draw(R, canvas) {
     var s = R.settings;
     var courts = s.courts, nSlots = R.plan.nSlots;
@@ -115,8 +115,9 @@
           ctx.fillText(m.type, mid, y + 24);
           ctx.fillText("vs", mid, y + 88);
           ctx.fillStyle = COLOR.text;
-          fitText(ctx, m.t1.join(" · "), mid, y + 57, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
-          fitText(ctx, m.t2.join(" · "), mid, y + 120, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
+          // show1·show2: 화면과 같은 표시 순서 (8.1, 혼복은 남자 먼저)
+          fitText(ctx, m.show1.join(" · "), mid, y + 57, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
+          fitText(ctx, m.show2.join(" · "), mid, y + 120, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
         } else {
           ctx.fillStyle = COLOR.empty;
           ctx.fillRect(cx, y, L.cellW, L.rowH);
