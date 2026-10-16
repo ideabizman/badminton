@@ -55,8 +55,6 @@ body {
 .steps li button:hover:not(.locked):not(.active) { background: #f2f5fa; }
 .step-msg { max-width: 960px; margin: 0 auto; padding: 0 16px 8px; color: var(--warn); font-size: 0.9rem; text-align: center; }
 .step-msg:empty { display: none; }
-.soon { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
-.soon small { color: var(--muted); }
 .kakao-url { flex: 1; min-width: 200px; }
 
 main { max-width: 960px; margin: 0 auto; padding: 16px; }
@@ -113,6 +111,9 @@ th { background: var(--head); }
 table.roster td input { width: 100%; min-width: 90px; }
 table.roster td.warn { color: var(--warn); text-align: left; font-size: 0.9rem; min-width: 120px; }
 table.roster td.num { color: var(--muted); width: 2.5em; }
+table.roster td input.arrival { min-width: 70px; width: 6.5em; }
+#result-late table { width: auto; }
+.late-line { color: var(--primary); font-weight: bold; margin: 4px 0; }
 
 .summary { margin: 12px 0; }
 .summary table { width: auto; }

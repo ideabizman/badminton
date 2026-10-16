@@ -70,10 +70,11 @@
     ctx.fillStyle = COLOR.bg;
     ctx.fillRect(0, 0, sz.width, sz.height);
 
-    // 머리글 3줄: 제목 / 날짜·대진 번호·앱 버전 / 인원·코트·경기 수·1경기 적게
+    // 머리글 3줄: 제목 / 날짜·대진 번호·앱 버전 / 인원·코트·경기 수·늦게 옴(W5)·1경기 적게
     var center = sz.width / 2, inner = sz.width - L.pad * 2;
     var line2 = dateLabel(s.date) + " · 대진 번호 " + R.seed + " · 앱 버전 " + R.version;
     var line3 = R.roster.length + "명 · " + courts + "면 · " + R.rows.length + "경기" +
+      (R.late && R.late.length ? " · 늦게 옴 " + R.late.length + "명" : "") +
       (R.fewer.length ? " · 1경기 적게: " + R.fewer.join(", ") : "");
     ctx.fillStyle = COLOR.text;
     fitText(ctx, "배드민턴 대진표", center, L.pad + 26, inner, 36, 24, true, null);

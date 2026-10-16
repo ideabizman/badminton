@@ -1,5 +1,5 @@
 /*
- * checker.js — 대진표 자기 점검 ⓐ–ⓕ만 담는다 (CLAUDE.md 6.3, 10절 1번).
+ * checker.js — 대진표 자기 점검 ⓐ–ⓕ(늦게 온 사람이 있으면 ⓖ–ⓙ도)만 담는다 (CLAUDE.md 6.3, 10절 1번).
  * scheduler.js의 함수·상수를 쓰지 않는다. 급수 점수표도 여기서 따로 갖는다.
  * 입력은 Excel `대진표` 시트에 쓰는 것과 같은 표(이름·텍스트 시각)이고,
  * 성별·급수는 대진표의 표기가 아니라 명단에서 다시 읽어 대조한다 (verify_schedule.py와 같은 방식).
@@ -23,12 +23,45 @@
 
   function teamKey(team) { return team.slice().sort().join("·"); }
 
+  // "HH:MM"(두 자리)만 분으로. 그 밖은 null
+  function hm(s) {
+    var m = /^(\d{2}):(\d{2})$/.exec(String(s == null ? "" : s).trim());
+    if (!m) return null;
+    var h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+    return h <= 23 && mi <= 59 ? h * 60 + mi : null;
+  }
+
   /*
-   * roster: [{name, gender, grade}]
-   * rows:   [{no, time:"HH:MM", court, t1:[이름,이름], t2:[이름,이름], type, s1, s2}]
-   * 돌려주는 값: { items: [{code, item, rule, count, detail}] (ⓐ–ⓕ), extra: [...] (참고), total }
+   * 6.6 참가 시각 (개정 7). opts: {start, minutes, courts, games}. 늦게 온 사람 = 참가 시각 > 시작 시각.
+   * 시간대 수 S와 첫 가능 시간대 f, 최소 L은 scheduler.js를 쓰지 않고 명세 6.2·6.5·6.6의 식으로 따로 계산한다.
    */
-  function check(roster, rows) {
+  function lateInfo(roster, opts) {
+    var out = {};
+    var start = opts ? hm(opts.start) : null;
+    if (start === null) return out;
+    var n = roster.length;
+    var total = Math.floor(n * opts.games / 4);                 // (인원 × 경기 수 − 나머지) ÷ 4
+    var S = Math.ceil(total / opts.courts);
+    roster.forEach(function (p) {
+      var a = hm(p.arrival);
+      if (a === null || a <= start) return;
+      var f = 0;
+      while (f < S && start + f * opts.minutes < a) f++;
+      out[p.name] = { arrival: String(p.arrival).trim(), min: a, f: f, L: S > 0 ? Math.floor(opts.games * (S - f) / S) : 0 };
+    });
+    return out;
+  }
+
+  /*
+   * roster: [{name, gender, grade, arrival}]
+   * rows:   [{no, time:"HH:MM", court, t1:[이름,이름], t2:[이름,이름], type, s1, s2}]
+   * opts:   {start, minutes, courts, games} (없으면 늦게 온 사람 없음으로 봄)
+   * 돌려주는 값: { items: [{code, item, rule, count, detail}] (ⓐ–ⓕ, 늦게 온 사람이 있으면 ⓖ–ⓙ도), extra: [...] (참고), total }
+   * 늦게 온 사람이 없으면 항목·문구·상세가 1.1.0과 같다.
+   */
+  function check(roster, rows, opts) {
+    var late = lateInfo(roster, opts);
+    var hasLate = Object.keys(late).length > 0;
     var info = {};
     roster.forEach(function (p) { info[p.name] = { gender: p.gender, score: GRADE_SCORE[p.grade] }; });
     var items = [];
@@ -37,6 +70,14 @@
       .sort(function (a, b) { return minutes(a) - minutes(b); });
     var slotOf = {};
     times.forEach(function (t, i) { slotOf[t] = i; });
+    // W5: 늦게 온 사람이 있으면 경기가 없는 시간대가 생길 수 있다. 설정(시작·경기 시간)을 알면 시간대 번호를 시각으로 계산해
+    // 빈 시간대를 건너뛴 두 경기를 연속으로 세지 않는다. 모든 시간대에 경기가 있으면 위의 번호와 같다
+    var start0 = opts ? hm(opts.start) : null;
+    if (start0 !== null && opts.minutes > 0) {
+      times.forEach(function (t) { slotOf[t] = Math.round((((minutes(t) - start0) % 1440) + 1440) % 1440 / opts.minutes); });
+    }
+    var timeOfSlot = {};
+    times.forEach(function (t) { timeOfSlot[slotOf[t]] = t; });
     function people(m) { return m.t1.concat(m.t2); }
 
     // ⓐ 한 시간대에 한 사람이 두 코트(또는 한 경기에 두 번) 배정
@@ -62,7 +103,7 @@
     });
     var b = [];
     Object.keys(played).forEach(function (p) {
-      played[p].forEach(function (s) { if (played[p].has(s + 1)) b.push(p + "(" + times[s] + "→" + times[s + 1] + ")"); });
+      played[p].forEach(function (s) { if (played[p].has(s + 1)) b.push(p + "(" + timeOfSlot[s] + "→" + timeOfSlot[s + 1] + ")"); });
     });
     items.push({ code: "ⓑ", item: "같은 참가자의 연속 경기 없음", rule: "연속 시간대 출전 0회",
       count: b.length, detail: b.slice(0, SHOW).join(", ") });
@@ -75,16 +116,16 @@
     items.push({ code: "ⓒ", item: "같은 파트너 2회 이상 없음", rule: "파트너 조합 1회",
       count: cCount, detail: c.slice(0, SHOW).join(", ") });
 
-    // ⓓ 1인당 경기 수 차이 ≤ 1 (명단 전원 기준, 0경기인 사람 포함)
+    // ⓓ 1인당 경기 수 차이 ≤ 1 (정시 참가자 기준, 0경기인 사람 포함. 개정 7 — 늦게 온 사람이 없으면 명단 전원)
     var games = {};
     roster.forEach(function (p) { games[p.name] = 0; });
     rows.forEach(function (m) { people(m).forEach(function (p) { if (p in games) games[p] += 1; }); });
-    var counts = Object.keys(games).map(function (p) { return games[p]; });
+    var counts = Object.keys(games).filter(function (p) { return !late[p]; }).map(function (p) { return games[p]; });
     var lo = counts.length ? Math.min.apply(null, counts) : 0;
     var hi = counts.length ? Math.max.apply(null, counts) : 0;
     var dist = {};
     counts.forEach(function (v) { dist[v] = (dist[v] || 0) + 1; });
-    items.push({ code: "ⓓ", item: "1인당 경기 수 차이 1 이하", rule: "최대 − 최소 ≤ 1",
+    items.push({ code: "ⓓ", item: "1인당 경기 수 차이 1 이하" + (hasLate ? " (정시 참가자)" : ""), rule: "최대 − 최소 ≤ 1",
       count: hi - lo > 1 ? 1 : 0,
       detail: "최소 " + lo + "경기, 최대 " + hi + "경기 (" +
         Object.keys(dist).sort(function (x, y) { return x - y; }).map(function (k) { return k + "경기 " + dist[k] + "명"; }).join(", ") + ")" });
@@ -108,6 +149,36 @@
     });
     items.push({ code: "ⓕ", item: "두 팀 급수 점수 합 차이 1 이하", rule: "|팀1 합 − 팀2 합| ≤ " + MAX_GRADE_DIFF,
       count: f.length, detail: f.slice(0, SHOW).join(", ") });
+
+    // ⓖ–ⓙ 늦게 온 사람 (6.3 개정 7, 6.6). 늦게 온 사람이 있을 때만
+    if (hasLate) {
+      var lateNames = Object.keys(late);
+      // ⓖ 참가 시각 전에 시작하는 경기에 배정 = 첫 가능 시간대 전 배정. (사람, 경기) 쌍을 센다
+      var gv = [];
+      rows.forEach(function (m) {
+        people(m).forEach(function (p) { if (late[p] && minutes(m.time) < late[p].min) gv.push(p + "(" + late[p].arrival + " 도착, " + m.time + " 경기)"); });
+      });
+      items.push({ code: "ⓖ", item: "늦게 온 사람이 참가 시각 전 경기에 배정되지 않음", rule: "도착 전 배정 0건",
+        count: gv.length, detail: gv.slice(0, SHOW).join(", ") });
+      // ⓗ 최소 경기 수 이상 (사람 수)
+      var hv = lateNames.filter(function (p) { return games[p] < late[p].L; })
+        .map(function (p) { return p + "(" + games[p] + " < 최소 " + late[p].L + ")"; });
+      items.push({ code: "ⓗ", item: "늦게 온 사람의 경기 수가 최소 경기 수 이상", rule: "최소 미달 0명",
+        count: hv.length, detail: hv.slice(0, SHOW).join(", ") });
+      // ⓘ 정시 참가자의 최대 경기 수 이하 (사람 수)
+      var iv = lateNames.filter(function (p) { return games[p] > hi; })
+        .map(function (p) { return p + "(" + games[p] + " > 정시 최대 " + hi + ")"; });
+      items.push({ code: "ⓘ", item: "늦게 온 사람의 경기 수가 정시 참가자의 최대 이하", rule: "정시 최대 초과 0명",
+        count: iv.length, detail: iv.slice(0, SHOW).join(", ") });
+      // ⓙ 같은 참가 시각인 늦게 온 사람끼리 차이 ≤ 1 (참가 시각 묶음 수)
+      var groups = {};
+      lateNames.forEach(function (p) { (groups[late[p].arrival] = groups[late[p].arrival] || []).push(games[p]); });
+      var jv = Object.keys(groups).sort().filter(function (k) {
+        return Math.max.apply(null, groups[k]) - Math.min.apply(null, groups[k]) > 1;
+      }).map(function (k) { return k + "(" + Math.min.apply(null, groups[k]) + "–" + Math.max.apply(null, groups[k]) + "경기)"; });
+      items.push({ code: "ⓙ", item: "같은 참가 시각인 늦게 온 사람끼리 경기 수 차이 1 이하", rule: "최대 − 최소 ≤ 1인 묶음",
+        count: jv.length, detail: jv.slice(0, SHOW).join(", ") });
+    }
 
     // ── 참고 검사 (ⓐ–ⓕ 합계에는 넣지 않음) ──
     var extra = [];

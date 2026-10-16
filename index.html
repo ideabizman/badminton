@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>배드민턴 대진표 만들기</title>
-  <link rel="stylesheet" href="style.css?v=2026-10-16">
+  <link rel="stylesheet" href="style.css?v=2026-10-16-w5">
 </head>
 <body>
   <header class="top">
@@ -68,6 +68,7 @@
             <label>이름 <select id="pick-name"></select></label>
             <label>성별 <select id="pick-gender"></select></label>
             <label>급수 <select id="pick-grade"></select></label>
+            <label>참가 시각 (없으면 비워 두기) <select id="pick-arrival"></select></label>
           </div>
           <button type="button" id="pick-apply" class="primary">이 열로 불러오기</button>
         </div>
@@ -75,7 +76,7 @@
 
       <div class="table-wrap">
         <table class="roster">
-          <thead><tr><th>#</th><th>이름</th><th>성별</th><th>급수</th><th>확인</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th>이름</th><th>성별</th><th>급수</th><th>참가 시각</th><th>확인</th><th></th></tr></thead>
           <tbody id="roster-body"></tbody>
         </table>
       </div>
@@ -86,6 +87,7 @@
 
       <div class="summary" id="roster-summary"></div>
       <p class="hint">성별은 남/여, 급수는 A·B·C·D·초심 중에서 고릅니다. ⚠ 표시가 있으면 고쳐 주세요.</p>
+      <p class="hint">참가 시각은 늦게 오는 사람만 넣습니다 (예: 19:30). 비우면 정시 참가입니다.</p>
 
       <div class="actions">
         <button type="button" id="roster-back">처음으로</button>
@@ -105,10 +107,6 @@
         <label>1인당 경기 수 <input type="number" id="set-games" min="1" step="1"></label>
         <label>대진 번호 <input id="set-seed" inputmode="numeric" maxlength="6" placeholder="비우면 새 번호">
           <small>6자리 숫자. 같은 번호를 넣으면 같은 대진을 다시 만듭니다.</small></label>
-      </div>
-      <div class="soon">
-        <button type="button" id="set-arrival" disabled>참가자별 참가 시각 (준비 중)</button>
-        <small>늦게 오는 사람의 시작 시각을 따로 정하는 기능입니다. 다음 단계에서 추가합니다.</small>
       </div>
       <p class="error" id="settings-error"></p>
 
@@ -137,6 +135,7 @@
       <div class="meta" id="result-meta"></div>
       <div class="box" id="result-check"></div>
       <div class="notice" id="result-fewer" hidden></div>
+      <div class="box" id="result-late" hidden></div>
 
       <div class="tabs" role="tablist">
         <button type="button" role="tab" data-rtab="grid" class="active">전체 대진표</button>
@@ -172,11 +171,11 @@
 
   <!-- 순서대로 불러온다 (file://에서도 동작하도록 모듈을 쓰지 않음)
        ?v= 는 다시 올렸을 때 휴대폰이 옛 파일을 쓰지 않게 하려는 것 (12절). 올릴 때마다 app.js의 UI_BUILD와 같은 날짜로 바꾼다 -->
-  <script src="lib/exceljs.min.js?v=2026-10-16"></script>
-  <script src="scheduler.js?v=2026-10-16"></script>
-  <script src="checker.js?v=2026-10-16"></script>
-  <script src="advice.js?v=2026-10-16"></script>
-  <script src="image.js?v=2026-10-16"></script>
-  <script src="app.js?v=2026-10-16"></script>
+  <script src="lib/exceljs.min.js?v=2026-10-16-w5"></script>
+  <script src="scheduler.js?v=2026-10-16-w5"></script>
+  <script src="checker.js?v=2026-10-16-w5"></script>
+  <script src="advice.js?v=2026-10-16-w5"></script>
+  <script src="image.js?v=2026-10-16-w5"></script>
+  <script src="app.js?v=2026-10-16-w5"></script>
 </body>
 </html>
