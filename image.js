@@ -55,10 +55,11 @@
     if (stats && ctx.measureText(text).width > maxW) stats.clipped += 1;
   }
 
-  // R: app.js의 결과 객체 (settings, seed, version, roster, rows(show1·show2 포함), plan, fewer)
-  function draw(R, canvas) {
+  // R: app.js의 결과 객체 (settings, seed, version, roster, rows(show1·show2 포함), S, loads, lastEnd)
+  // summary: 화면 요약 줄과 같은 글 ("31명 · 3면 · 30경기 · 빈 코트 0 · 2연속 0회 …")
+  function draw(R, summary, canvas) {
     var s = R.settings;
-    var courts = s.courts, nSlots = R.plan.nSlots;
+    var courts = s.courts, nSlots = R.S;
     var sz = size(courts, nSlots);
     canvas = canvas || document.createElement("canvas");
     canvas.width = sz.width;
@@ -70,12 +71,10 @@
     ctx.fillStyle = COLOR.bg;
     ctx.fillRect(0, 0, sz.width, sz.height);
 
-    // 머리글 3줄: 제목 / 날짜·대진 번호·앱 버전 / 인원·코트·경기 수·늦게 옴(W5)·1경기 적게
+    // 머리글 3줄: 제목 / 날짜·대진 번호·앱 버전 / 화면 요약 줄 (W5b)
     var center = sz.width / 2, inner = sz.width - L.pad * 2;
     var line2 = dateLabel(s.date) + " · 대진 번호 " + R.seed + " · 앱 버전 " + R.version;
-    var line3 = R.roster.length + "명 · " + courts + "면 · " + R.rows.length + "경기" +
-      (R.late && R.late.length ? " · 늦게 옴 " + R.late.length + "명" : "") +
-      (R.fewer.length ? " · 1경기 적게: " + R.fewer.join(", ") : "");
+    var line3 = summary || (R.roster.length + "명 · " + courts + "면 · " + R.rows.length + "경기");
     ctx.fillStyle = COLOR.text;
     fitText(ctx, "배드민턴 대진표", center, L.pad + 26, inner, 36, 24, true, null);
     fitText(ctx, line2, center, L.pad + 76, inner, 26, 18, true, null);
@@ -104,6 +103,16 @@
       ctx.fillText(Scheduler.slotTime(s.start, s.minutes, slot), x0 + L.timeW / 2, y + L.rowH / 2 - 16);
       ctx.font = font(22, false);
       ctx.fillText("~" + Scheduler.slotTime(s.start, s.minutes, slot + 1), x0 + L.timeW / 2, y + L.rowH / 2 + 16);
+      if (!R.loads[slot]) {
+        // D3: 경기가 하나도 없는 시간대는 줄 전체에 한 문구 (칸 선은 아래에서 이 줄만 건너뜀)
+        ctx.fillStyle = COLOR.empty;
+        ctx.fillRect(xGrid, y, L.cellW * courts, L.rowH);
+        ctx.fillStyle = COLOR.emptyText;
+        ctx.font = font(26, true);
+        ctx.fillText("이 시간에는 경기 없음", xGrid + L.cellW * courts / 2, y + L.rowH / 2);
+        y += L.rowH;
+        continue;
+      }
       for (c = 1; c <= courts; c++) {
         var cx = xGrid + L.cellW * (c - 1);
         var mid = cx + L.cellW / 2;
@@ -138,7 +147,17 @@
     ctx.beginPath();
     for (var yy = top; yy <= gridBottom; yy += (yy === top ? L.headRowH : L.rowH)) { ctx.moveTo(x0, yy + 0.5); ctx.lineTo(gridRight, yy + 0.5); }
     ctx.moveTo(x0 + 0.5, top); ctx.lineTo(x0 + 0.5, gridBottom);
-    for (c = 0; c <= courts; c++) { var xx = xGrid + L.cellW * c; ctx.moveTo(xx + 0.5, top); ctx.lineTo(xx + 0.5, gridBottom); }
+    for (c = 0; c <= courts; c++) {
+      var xx = xGrid + L.cellW * c;
+      if (c === 0 || c === courts) { ctx.moveTo(xx + 0.5, top); ctx.lineTo(xx + 0.5, gridBottom); continue; }
+      // 코트 사이 세로선은 경기 없는 줄을 건너뛴다
+      ctx.moveTo(xx + 0.5, top); ctx.lineTo(xx + 0.5, top + L.headRowH);
+      for (var sl = 0; sl < nSlots; sl++) {
+        if (!R.loads[sl]) continue;
+        var y1 = top + L.headRowH + L.rowH * sl;
+        ctx.moveTo(xx + 0.5, y1); ctx.lineTo(xx + 0.5, y1 + L.rowH);
+      }
+    }
     ctx.stroke();
 
     // 경기 종류 색 설명
@@ -157,13 +176,15 @@
     });
     ctx.textAlign = "left";
     ctx.fillStyle = COLOR.muted;
-    ctx.fillText(R.rows.length + "경기 · " + s.minutes + "분씩 · " + s.start + " ~ " + Scheduler.slotTime(s.start, s.minutes, nSlots), lx + 12, ly);
+    var endFull = Scheduler.slotTime(s.start, s.minutes, nSlots);
+    ctx.fillText(R.rows.length + "경기 · " + s.minutes + "분씩 · " + s.start + " ~ " + endFull +
+      (R.lastEnd && R.lastEnd !== endFull ? " · 실제 마지막 경기 종료 " + R.lastEnd : ""), lx + 12, ly);
 
     return { canvas: canvas, width: sz.width, height: sz.height, stats: stats };
   }
 
-  function toPngBlob(R) {
-    var d = draw(R);
+  function toPngBlob(R, summary) {
+    var d = draw(R, summary);
     return new Promise(function (resolve, reject) {
       d.canvas.toBlob(function (blob) {
         if (blob) resolve({ blob: blob, width: d.width, height: d.height, stats: d.stats });

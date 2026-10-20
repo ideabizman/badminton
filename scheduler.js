@@ -1,24 +1,30 @@
 /*
- * scheduler.js — 대진 생성 규칙만 담는다 (화면 코드와 분리).
- * M9 make_schedule.py(10_실습\M9_badminton)를 JavaScript로 옮긴 것이다. CLAUDE.md 6·7절.
+ * scheduler.js — 대진 생성 규칙만 담는다 (화면 코드와 분리). CLAUDE.md 개정 8의 6·7절, _work\plan_w5b.md 2절.
+ * 2.0.0: 시간·코트가 먼저 정해지고 1인당 경기 수는 참여 시간에 비례해 계산한다 (1.x 생성 코드는 _work\scheduler_v1.2.0.js).
  * file://에서도 동작하도록 ES 모듈이 아닌 일반 스크립트로, 전역 객체 Scheduler 하나만 내보낸다.
  * 무작위 선택은 모두 대진 번호를 씨앗값으로 쓰는 난수 생성기로만 한다 (Math.random 사용 금지).
+ *
+ * 계산 단계 (plan_w5b.md 2.8, W7을 위해 단계마다 따로 부를 수 있게 나눔)
+ *   slots → intervals(fₚ, lₚ, mₚ, Aₜ, Hₚ) → loadCaps / upperBound / lexLoads(부하 목록) → quotas(qₚ, 정수 목표) → createSearch
  */
 (function (global) {
   "use strict";
 
-  // 이 파일의 생성 결과가 바뀌면 올린다 (CLAUDE.md 7절).
-  // 1.1.0 (CLAUDE.md 개정 3): 6.5 성별 짝수 조건, 5절 상충 안내(성별 짝수·코트 1면 8명) 추가
-  // 1.2.0 (CLAUDE.md 개정 7): 6.6 참가자별 참가 시각. 늦게 온 사람이 없으면 1.1.0 함수를 그대로 탄다
-  var SCHEDULER_VERSION = "1.2.0";
+  // 이 파일의 생성 결과가 바뀌면 올린다 (CLAUDE.md 7절)
+  // 2.0.0 (CLAUDE.md 개정 8): 종료 시각·코트 수 입력, 참여 시간 비례 몫, 2연속 허용(3연속 금지), 빈 코트는 뒤로
+  var SCHEDULER_VERSION = "2.0.0";
 
   var GRADE_SCORE = { A: 4, B: 3, C: 2, D: 1, "초심": 0 };   // 6.1
-  var GENDERS = ["남", "여"];
-  var PLAYERS_PER_COURT_RULE = 8;      // 권장 코트 수 = 인원 ÷ 8 (내림, 최소 1면)
   var MAX_GRADE_DIFF = 1;
-  var MAX_RESTARTS = 20000;            // M9와 같은 값
-  var SOLUTIONS_TO_COMPARE = 30;       // 이 개수만큼 해를 찾아 '같은 상대 반복'이 가장 적은 해를 고른다 (6.4)
-  var SLOT_ATTEMPTS = 60;              // 한 시간대를 채우는 시도 횟수 (M9와 같은 값)
+  var SOLUTIONS_TO_COMPARE = 30;       // 6.7: 이 개수만큼 해를 찾아 고른다
+  var SLOT_ATTEMPTS = 60;              // 한 시간대를 채우는 시도 횟수 (1.x와 같은 값)
+  var RESTED_ATTEMPTS = 20;            // 그 앞에 직전에 쉰 사람만으로 채워 보는 시도 횟수 (plan 2.4)
+  var TRIES_PER_M = 5000;              // plan 2.5: M마다 시도 횟수
+  var STRICT_TRIES = 2500;             // 그중 앞부분은 사전순 최대 부하 목록 그대로
+  var MAX_SEARCH_DROPS = 3;            // 탐색으로 M을 줄이는 횟수 한도
+  var MAX_TOTAL_TRIES = 20000;         // 전체 시도 한도 (1.x MAX_RESTARTS와 같음)
+  var QUOTA_REDRAW = 250;              // 한 M에서 이만큼 시도해도 못 찾으면 몫 동점 순서를 다시 뽑는다 (W5b 시험 중 결함 수정 1)
+  var QUOTA_SALT = 0x85EBCA6B;         // 몫 동점 난수 줄기 (생성 난수와 다름)
 
   // ── 난수 ─────────────────────────────────────────────────
   // mulberry32: 32비트 씨앗값 하나로 [0, 1) 난수를 만드는 작은 생성기
@@ -33,7 +39,7 @@
     };
   }
 
-  // Python random.shuffle과 같은 순서(뒤에서부터)의 Fisher–Yates
+  // 뒤에서부터 섞는 Fisher–Yates
   function shuffle(arr, rng) {
     for (var i = arr.length - 1; i > 0; i--) {
       var j = Math.floor(rng() * (i + 1));
@@ -59,92 +65,258 @@
     });
   }
 
-  // ── 규모 계산 ────────────────────────────────────────────
-  function recommendedCourts(n) {
-    return Math.max(1, Math.floor(n / PLAYERS_PER_COURT_RULE));
-  }
-
+  // ── 시각 ─────────────────────────────────────────────────
   function pad2(v) { return (v < 10 ? "0" : "") + v; }
 
-  // start "HH:MM" + minutes × t → "HH:MM" (자정을 넘으면 0시부터 다시)
-  function slotTime(start, minutes, t) {
-    var parts = start.split(":");
-    var m = (parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10) + minutes * t) % 1440;
+  // "HH:MM"(두 자리 시:분, 00:00–23:59)만 분으로 바꾼다. 그 밖은 null (추측하지 않음)
+  function parseHM(s) {
+    var m = /^(\d{2}):(\d{2})$/.exec(String(s == null ? "" : s).trim());
+    if (!m) return null;
+    var h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+    return h <= 23 && mi <= 59 ? h * 60 + mi : null;
+  }
+
+  function fmtHM(min) {
+    var m = ((min % 1440) + 1440) % 1440;
     return pad2(Math.floor(m / 60)) + ":" + pad2(m % 60);
   }
 
-  // 6.2 + 6.5: 총 경기 수, 나머지 r, 시간대 수, 시간대별 경기 수(고르게)
-  function computePlan(n, courts, games) {
-    var appearances = n * games;
-    var r = appearances % 4;
-    var total = (appearances - r) / 4;
-    var nSlots = courts > 0 ? Math.ceil(total / courts) : 0;
-    var base = nSlots > 0 ? Math.floor(total / nSlots) : 0;
-    var extra = nSlots > 0 ? total - base * nSlots : 0;
-    return { n: n, courts: courts, games: games, total: total, r: r, nSlots: nSlots, base: base, extra: extra };
+  // start "HH:MM" + minutes × t → "HH:MM"
+  function slotTime(start, minutes, t) { return fmtHM(parseHM(start) + minutes * t); }
+
+  // ── 6.2 시간대와 참여 구간 ───────────────────────────────
+  // settings: {start, end, minutes, courts, maxGames(없으면 null)}
+  function slots(settings) {
+    var st = parseHM(settings.start), en = parseHM(settings.end), d = settings.minutes;
+    var S = st !== null && en !== null && d >= 1 && en > st ? Math.floor((en - st) / d) : 0;
+    return { S: S, start: st, end: en, minutes: d };
   }
 
-  // 5절: 설정이 규칙상 불가능해 보이는 경우를 찾아 이유·바꿀 항목을 돌려준다 (값은 바꾸지 않는다)
-  function checkFeasibility(roster, courts, games) {
-    var n = roster.length;
-    var plan = computePlan(n, courts, games);
-    var out = [];
-    if (plan.total === 0) {
-      out.push({ reason: "만들 경기가 없습니다.", fix: "1인당 경기 수를 늘려 보세요." });
-      return out;
-    }
-    var need = 2 * games - 1;
-    if (plan.nSlots < need) {
-      out.push({
-        reason: "시간대가 " + plan.nSlots + "개뿐이라, 연속 경기 없이 한 사람이 " + games + "경기를 하려면 시간대가 " + need + "개 이상 필요합니다.",
-        fix: "코트 수를 줄이거나 1인당 경기 수를 줄여 보세요."
-      });
-    }
-    // 큰 시간대(base+1경기)끼리 붙지 않게 놓을 수 있으면 가장 붐비는 인접 두 시간대는 (base+1)+base 경기
-    if (plan.nSlots >= 2) {
-      var bigCanSeparate = plan.extra <= Math.ceil(plan.nSlots / 2);
-      var pairGames;
-      if (plan.extra === 0) pairGames = 2 * plan.base;
-      else if (bigCanSeparate) pairGames = 2 * plan.base + 1;
-      else pairGames = 2 * plan.base + 2;
-      if (pairGames * 4 > n) {
-        out.push({
-          reason: "이어지는 두 시간대에 " + (pairGames * 4) + "명이 경기해야 하는데 전체가 " + n + "명이라, 쉬지 않고 연달아 뛰는 사람이 생깁니다.",
-          fix: "코트 수를 줄여 보세요 (권장 " + recommendedCourts(n) + "면)."
-        });
-      }
-    }
-    // 5절: 성별마다 출전 횟수 합이 홀수 (6.5의 성별 나눔으로도 짝수로 만들 수 없을 때)
-    var men = roster.filter(function (p) { return p.gender === "남"; }).length;
-    var women = n - men;
-    if (fewerSplits(men, women, games, plan.r).length === 0) {
-      out.push({
-        reason: "남자 출전 횟수 합(" + men + "명 × " + games + "경기)이나 여자 출전 횟수 합(" + women + "명 × " + games + "경기)이 홀수가 되어 짝을 맞출 수 없습니다. 한 경기에 남자·여자는 0·2·4명씩 들어가기 때문입니다.",
-        fix: "1인당 경기 수를 바꿔 보세요."
-      });
-    }
-    // 5절: 코트 1면에 8명이면 연속 경기 금지 때문에 같은 4명끼리 번갈아 경기하게 되어 4경기부터는 파트너가 반드시 겹친다
-    if (courts === 1 && n === 8 && games >= 4) {
-      out.push({
-        reason: "코트 1면에 8명이면 같은 4명끼리 번갈아 경기하게 됩니다. 4명이 만들 수 있는 파트너 조합은 3가지뿐이라 " + games + "경기를 하면 같은 파트너가 반드시 다시 나옵니다.",
-        fix: "1인당 경기 수를 3 이하로 줄이거나 인원을 늘려 보세요."
-      });
-    }
-    GENDERS.forEach(function (g) {
-      var cnt = roster.filter(function (p) { return p.gender === g; }).length;
-      if (cnt === 1) {
-        out.push({
-          reason: (g === "남" ? "남자" : "여자") + "가 1명뿐입니다. 혼복끼리 붙으려면 " + (g === "남" ? "남자" : "여자") + "가 2명 이상 필요해서 이 사람은 경기할 수 없습니다.",
-          fix: "명단을 확인해 보세요."
-        });
-      }
+  // 3연속 금지에서 n개 시간대에 할 수 있는 최대 경기 수. run = 바로 앞에서 이미 이어서 뛴 수(0·1·2)
+  var maxPlaysMemo = {};
+  function maxPlays(n, run) {
+    if (n <= 0) return 0;
+    var key = n + ":" + run;
+    if (key in maxPlaysMemo) return maxPlaysMemo[key];
+    var c = run, cnt = 0;
+    for (var i = 0; i < n; i++) { if (c < 2) { cnt++; c++; } else c = 0; }   // 뛸 수 있으면 뛰는 것이 최대
+    maxPlaysMemo[key] = cnt;
+    return cnt;
+  }
+
+  function capOf(m, maxGames) {
+    if (m <= 0) return 0;
+    var h = m - Math.floor(m / 3);
+    return maxGames ? Math.min(h, maxGames) : h;
+  }
+
+  /*
+   * 사람마다 fₚ, lₚ, mₚ, Hₚ와 시간대마다 Aₜ. 참가 시각이 비었으면 시작, 퇴장 시각이 비었으면 종료 (자정 넘김은 다루지 않음).
+   * 참가 시각이 시작보다 이르면 f = 0 (plan Q12), 퇴장 시각이 종료보다 늦으면 l = S − 1.
+   * 형식이 아닌 시각은 화면에서 ⚠로 막으므로 여기서는 정시·끝까지로 본다.
+   */
+  function intervals(roster, settings) {
+    var sl = slots(settings), S = sl.S, d = sl.minutes;
+    var people = roster.map(function (p, i) {
+      var a = parseHM(p.arrival), e = parseHM(p.leave);
+      if (a === null) a = sl.start;
+      if (e === null) e = sl.end;
+      var f = 0;
+      while (f < S && sl.start + f * d < a) f++;               // tᵢ ≥ 참가 시각인 가장 작은 i (없으면 S)
+      var l = S - 1;
+      while (l >= 0 && sl.start + l * d + d > e) l--;           // tᵢ + d ≤ 퇴장 시각인 가장 큰 i (없으면 −1)
+      var m = l - f + 1;
+      return { index: i, f: f, l: l, m: m, H: capOf(m, settings.maxGames), late: f > 0, early: l < S - 1 };
     });
+    var A = [];
+    for (var t = 0; t < S; t++) A.push(people.filter(function (p) { return p.f <= t && t <= p.l; }).length);
+    return { S: S, slots: sl, people: people, A: A, bad: people.filter(function (p) { return p.m <= 0; }) };
+  }
+
+  // ── 6.5 상한 M과 부하 목록 (plan 2.2) ─────────────────────
+  // slotCap[t] = min(C, ⌊Aₜ/4⌋), win[t] = 시간대 t, t+1, t+2의 경기 수 합 상한 (한 사람은 세 칸 중 최대 2경기)
+  function loadCaps(iv, courts) {
+    var S = iv.S, t;
+    var slotCap = [], win = [];
+    for (t = 0; t < S; t++) slotCap.push(Math.min(courts, Math.floor(iv.A[t] / 4)));
+    for (t = 0; t + 2 < S; t++) {
+      var seats = 0;
+      iv.people.forEach(function (p) {
+        var ov = Math.min(p.l, t + 2) - Math.max(p.f, t) + 1;
+        if (ov > 0) seats += Math.min(2, ov);
+      });
+      win.push(Math.floor(seats / 4));
+    }
+    return { slotCap: slotCap, win: win, courts: courts };
+  }
+
+  /*
+   * 뒤에서부터 동적 계획: suffix[t][a][b] = 시간대 t−2, t−1의 경기 수가 a, b일 때 t…S−1에 넣을 수 있는 최대 경기 수.
+   * fixedLoads(W7): 앞쪽 시간대의 경기 수를 이미 정해진 값으로 묶는다. 2.0.0에서는 쓰지 않음
+   */
+  function suffixTable(caps, S, fixedLoads) {
+    var C = caps.courts, t, a, b, x;
+    var tbl = new Array(S + 1);
+    function grid(v) { var g = []; for (a = 0; a <= C; a++) { g.push([]); for (b = 0; b <= C; b++) g[a].push(v); } return g; }
+    tbl[S] = grid(0);
+    for (t = S - 1; t >= 0; t--) {
+      tbl[t] = grid(-Infinity);
+      for (a = 0; a <= C; a++) {
+        for (b = 0; b <= C; b++) {
+          var best = -Infinity;
+          for (x = 0; x <= caps.slotCap[t]; x++) {
+            if (fixedLoads && t < fixedLoads.length && x !== fixedLoads[t]) continue;
+            if (t >= 2 && a + b + x > caps.win[t - 2]) continue;
+            var v = x + tbl[t + 1][b][x];
+            if (v > best) best = v;
+          }
+          tbl[t][a][b] = best;
+        }
+      }
+    }
+    return tbl;
+  }
+
+  // 상한 M (6.5 + plan 2.2): min(시간대·3칸 창 조건의 최대 합, ⌊ΣHₚ/4⌋). 이유를 알 수 있게 각 값도 돌려준다
+  function upperBound(iv, courts, fixedLoads) {
+    var S = iv.S;
+    var caps = loadCaps(iv, courts);
+    var full = courts * S;
+    var bySlot = caps.slotCap.reduce(function (s, v) { return s + v; }, 0);
+    var tbl = S > 0 ? suffixTable(caps, S, fixedLoads) : null;
+    var byWindow = S > 0 ? Math.max(0, tbl[0][0][0]) : 0;
+    var byH = Math.floor(iv.people.reduce(function (s, p) { return s + p.H; }, 0) / 4);
+    return { M: Math.min(byWindow, byH), full: full, bySlot: bySlot, byWindow: byWindow, byH: byH, caps: caps, table: tbl };
+  }
+
+  // 같은 M을 만드는 부하 목록 중 앞에서부터 사전순으로 가장 큰 것 (빈 코트는 뒤로, 6.5)
+  function lexLoads(ub, S, M, fixedLoads) {
+    if (M > ub.byWindow) return null;
+    var caps = ub.caps, tbl = ub.table;
+    var loads = [], sum = 0, a = 0, b = 0;
+    for (var t = 0; t < S; t++) {
+      var pick = -1;
+      for (var x = Math.min(caps.slotCap[t], M - sum); x >= 0; x--) {
+        if (fixedLoads && t < fixedLoads.length && x !== fixedLoads[t]) continue;
+        if (t >= 2 && a + b + x > caps.win[t - 2]) continue;
+        if (sum + x + tbl[t + 1][b][x] >= M) { pick = x; break; }
+      }
+      if (pick < 0) return null;
+      loads.push(pick);
+      sum += pick; a = b; b = pick;
+    }
+    return sum === M ? loads : null;
+  }
+
+  // ── 6.4 몫 (plan 2.3) ──────────────────────────────────
+  /*
+   * 물 채우기: 몫 qₚ = R × mₚ ÷ Σm 에서 Hₚ를 넘는 사람은 Hₚ로 고정하고, 남은 자리를 나머지에게 다시 비례로 나눈다.
+   * 정수로: 모두 ⌊q⌋ → 남은 자리는 소수점 큰 사람부터(같으면 대진 번호 난수). 성별 합이 홀수면(4M이 짝수라 남·여가 함께 홀수)
+   * 남은 자리를 받은 사람 1명과 못 받은 다른 성별 1명을 바꾼다(소수점 순위가 가장 덜 어긋나는 쌍, plan Q2).
+   * 소수 오차가 없도록 마지막 단계의 몫을 분자/분모 정수로 다룬다.
+   * gd: 성별 배열. 돌려주는 값 ok: false → reason "cap"(상한 합 부족) | "parity"(짝수로 맞출 수 없음)
+   */
+  function quotas(iv, gd, M, seed, draw) {
+    var people = iv.people, n = people.length;
+    var R = 4 * M;
+    var fixed = new Array(n).fill(false);
+    var den = 1, num = new Array(n).fill(0);
+    for (;;) {
+      var sumM = 0, i;
+      for (i = 0; i < n; i++) if (!fixed[i] && people[i].m > 0) sumM += people[i].m;
+      if (sumM === 0) { if (R > 0) return { ok: false, reason: "cap" }; break; }
+      var over = [];
+      for (i = 0; i < n; i++) {
+        if (fixed[i] || people[i].m <= 0) continue;
+        if (R * people[i].m > people[i].H * sumM) over.push(i);    // q > H
+      }
+      if (!over.length) {
+        den = sumM;
+        for (i = 0; i < n; i++) num[i] = fixed[i] ? people[i].H * sumM : (people[i].m > 0 ? R * people[i].m : 0);
+        break;
+      }
+      over.forEach(function (j) { fixed[j] = true; R -= people[j].H; });
+      if (R < 0) return { ok: false, reason: "cap" };
+    }
+    var q = num.map(function (v) { return v / den; });
+    var target = num.map(function (v) { return Math.floor(v / den); });
+    var frac = num.map(function (v) { return v % den; });
+    var rest = 4 * M - target.reduce(function (s, v) { return s + v; }, 0);
+    // draw: 같은 M에서 동점 순서를 다시 뽑는 번호 (0이 처음). 다시 뽑아도 대진 번호 난수이고 ⓓ 범위 안이다
+    var rng = makeRng((seed ^ QUOTA_SALT ^ Math.imul(M, 0x9E3779B1) ^ Math.imul(draw || 0, 0x27D4EB2F)) >>> 0);
+    var rank = shuffle(Array.from({ length: n }, function (_, k) { return k; }), rng);
+    var rk = new Array(n);
+    rank.forEach(function (p, r) { rk[p] = r; });
+    var cand = [];
+    for (var c = 0; c < n; c++) if (frac[c] > 0) cand.push(c);
+    cand.sort(function (a, b) { return (frac[b] - frac[a]) || (rk[a] - rk[b]); });
+    if (rest > cand.length) return { ok: false, reason: "cap" };
+    var got = new Array(n).fill(false);
+    cand.slice(0, rest).forEach(function (p) { got[p] = true; target[p] += 1; });
+
+    var men = 0;
+    for (c = 0; c < n; c++) if (gd[c] === "남") men += target[c];
+    var swapped = null;
+    if (men % 2 !== 0) {
+      // 받은 사람 중 순위가 가장 낮은 사람 ↔ 못 받은 다른 성별 중 순위가 가장 높은 사람
+      var opts = [];
+      ["남", "여"].forEach(function (g) {
+        var giver = null, taker = null;
+        for (var k = cand.length - 1; k >= 0; k--) { var p = cand[k]; if (got[p] && gd[p] === g) { giver = p; break; } }
+        for (k = 0; k < cand.length; k++) { var w = cand[k]; if (!got[w] && gd[w] !== g) { taker = w; break; } }
+        if (giver !== null && taker !== null) opts.push({ giver: giver, taker: taker, loss: frac[giver] - frac[taker] });
+      });
+      if (!opts.length) return { ok: false, reason: "parity", q: q, target: target };
+      var minLoss = Math.min.apply(null, opts.map(function (o) { return o.loss; }));
+      opts = opts.filter(function (o) { return o.loss === minLoss; });
+      var pick = opts.length === 1 ? opts[0] : opts[Math.floor(rng() * opts.length)];
+      target[pick.giver] -= 1; target[pick.taker] += 1;
+      swapped = pick;
+    }
+    return { ok: true, q: q, target: target, swapped: swapped };
+  }
+
+  // ── 2연속 필요 판단 (5.1, plan 2.4) ──────────────────────
+  function needsDoubles(iv, target, loads) {
+    var why = [];
+    iv.people.forEach(function (p) {
+      if (p.m > 0 && target[p.index] > Math.ceil(p.m / 2)) why.push({ kind: "person", index: p.index });
+    });
+    for (var t = 0; t + 1 < iv.S; t++) {
+      var present = iv.people.filter(function (p) { return p.f <= t + 1 && p.l >= t; }).length;
+      if (4 * (loads[t] + loads[t + 1]) > present) why.push({ kind: "pair", slot: t });
+    }
+    return why;
+  }
+
+  /*
+   * 생성 전 계산 (② 화면의 예상 정보와 탐색 시작점). 성별 짝수로 안 되는 M은 계산으로 건너뛴다(시도 횟수를 쓰지 않음).
+   * 돌려주는 값: {iv, ub, M, loads, quota, parityDrops:[M…], reason}
+   */
+  function plan(roster, settings, seed, fixedLoads) {
+    var iv = intervals(roster, settings);
+    var gd = roster.map(function (p) { return p.gender; });
+    var ub = upperBound(iv, settings.courts, fixedLoads);
+    var out = { iv: iv, ub: ub, M: 0, loads: null, quota: null, parityDrops: [], reason: null };
+    if (iv.S < 1 || iv.bad.length) { out.reason = "input"; return out; }
+    var M = ub.M;
+    while (M > 0) {
+      var qt = quotas(iv, gd, M, seed);
+      if (qt.ok) {
+        out.M = M; out.quota = qt; out.loads = lexLoads(ub, iv.S, M, fixedLoads);
+        return out;
+      }
+      out.parityDrops.push(M);
+      M -= 1;
+    }
+    out.reason = out.parityDrops.length ? "parity" : "empty";
     return out;
   }
 
-  // ── 대진 생성 (make_schedule.py try_build / find_match 이식) ──────
+  // ── 대진 생성 ─────────────────────────────────────────────
   function pairKey(a, b) { return a < b ? a + "," + b : b + "," + a; }
 
+  // 1.x와 같은 짝 찾기: seed(첫 사람)로 시작해 pool 순서대로 파트너·상대를 고른다
   function findMatch(seed, pool, sc, gd, partners, rng) {
     var types = gd[seed] === "남" ? ["혼복", "남복"] : ["혼복", "여복"];
     shuffle(types, rng);
@@ -193,393 +365,78 @@
     return null;
   }
 
-  function tryBuild(sc, gd, target, plan, rng) {
-    var n = sc.length;
-    var nSlots = plan.nSlots;
-    var ks = [], t, p;
-    for (t = 0; t < plan.extra; t++) ks.push(plan.base + 1);         // 6.4: 시간대별 경기 수를 고르게
-    for (t = plan.extra; t < nSlots; t++) ks.push(plan.base);
-    shuffle(ks, rng);
-
+  /*
+   * 한 번 시도 (plan 2.4). 시간대를 앞에서부터 채운다.
+   * strict: loads[t]경기를 정확히 넣는다. flexible: 못 넣은 경기는 다음 시간대로 넘긴다(시간대 상한 안에서, 앞쪽 우선).
+   * 뽑는 순서: 이번에 안 뛰면 못 채우는 사람 → 직전에 쉰 사람 → 직전에 뛴 사람 중 2연속이 적은 사람 (같은 묶음은 남은 경기 + 난수)
+   * fixed(W7): {matches:[{slot,court,t1,t2,type}], fromSlot} — 고정 경기로 기록을 채우고 fromSlot부터 만든다. 2.0.0에서는 빈 값
+   */
+  function tryBuild(ctx, target, loads, flexible, rng) {
+    var n = ctx.n, S = ctx.S, f = ctx.f, l = ctx.l, sc = ctx.sc, gd = ctx.gd;
     var remaining = target.slice();
-    var last = [];
-    for (p = 0; p < n; p++) last.push(-99);
+    var run = new Array(n).fill(0);
+    var doubles = new Array(n).fill(0);
     var partners = new Set();
     var schedule = [];
-
-    for (t = 0; t < nSlots; t++) {
-      var k = ks[t];
-      var left = nSlots - t;
-      // 남은 시간대로 남은 경기를 연속 없이 채울 수 없으면 실패
-      for (p = 0; p < n; p++) {
-        var cap = last[p] === t - 1 ? Math.ceil((left - 1) / 2) : Math.ceil(left / 2);
-        if (remaining[p] > cap) return null;
-      }
-      var eligible = [];
-      for (p = 0; p < n; p++) if (remaining[p] > 0 && last[p] !== t - 1) eligible.push(p);
-      var urgent = new Set();                                     // 이번에 안 뛰면 못 채우는 사람
-      eligible.forEach(function (x) { if (remaining[x] > Math.ceil((left - 1) / 2)) urgent.add(x); });
-      if (urgent.size > 4 * k || eligible.length < 4 * k) return null;
-
-      var slotMatches = null;
-      for (var attempt = 0; attempt < SLOT_ATTEMPTS; attempt++) {
-        // Python의 sorted(key=...)처럼 목록 순서대로 난수를 뽑아 키를 만든 뒤 안정 정렬
-        var keyed = eligible.map(function (x, idx) {
-          return { p: x, u: urgent.has(x) ? 0 : 1, v: -remaining[x] + rng() * 1.5, idx: idx };
+    var actual = [];
+    var t, p, u;
+    var fromSlot = ctx.fixed ? ctx.fixed.fromSlot : 0;
+    if (ctx.fixed) {
+      for (t = 0; t < fromSlot; t++) {
+        var fm = ctx.fixed.matches.filter(function (m) { return m.slot === t; });
+        var on = {};
+        fm.forEach(function (m) {
+          schedule.push(m);
+          partners.add(pairKey(m.t1[0], m.t1[1])); partners.add(pairKey(m.t2[0], m.t2[1]));
+          m.t1.concat(m.t2).forEach(function (x) { on[x] = true; });
         });
-        keyed.sort(function (A, B) { return (A.u - B.u) || (A.v - B.v) || (A.idx - B.idx); });
-        var order = keyed.map(function (o) { return o.p; });
-        var used = new Set();
-        var ms = [];
-        for (var mi = 0; mi < k; mi++) {
-          var pool = order.filter(function (x) { return !used.has(x); });
-          if (!pool.length) break;
-          var m = findMatch(pool[0], pool.slice(1), sc, gd, partners, rng);
-          if (!m) break;
-          ms.push(m);
-          m.t1.concat(m.t2).forEach(function (x) { used.add(x); });
+        for (p = 0; p < n; p++) {
+          if (on[p]) { remaining[p] -= 1; if (run[p] >= 1) doubles[p] += 1; run[p] += 1; } else run[p] = 0;
         }
-        var allUrgent = true;
-        urgent.forEach(function (x) { if (!used.has(x)) allUrgent = false; });
-        if (ms.length === k && allUrgent) { slotMatches = ms; break; }
+        actual.push(fm.length);
       }
-      if (!slotMatches) return null;
-
-      slotMatches.forEach(function (m, ci) {
-        schedule.push({ slot: t, court: ci + 1, t1: m.t1, t2: m.t2, type: m.type });
-        partners.add(pairKey(m.t1[0], m.t1[1]));
-        partners.add(pairKey(m.t2[0], m.t2[1]));
-        m.t1.concat(m.t2).forEach(function (x) { remaining[x] -= 1; last[x] = t; });
-      });
     }
-    for (p = 0; p < n; p++) if (remaining[p]) return null;
-    return schedule;
-  }
-
-  function repeatOpponentPairs(schedule) {
-    var cnt = new Map();
-    schedule.forEach(function (m) {
-      m.t1.forEach(function (a) {
-        m.t2.forEach(function (b) {
-          var key = pairKey(a, b);
-          cnt.set(key, (cnt.get(key) || 0) + 1);
-        });
-      });
-    });
-    var c = 0;
-    cnt.forEach(function (v) { if (v >= 2) c++; });
-    return c;
-  }
-
-  /*
-   * 6.5 성별 짝수 조건: 1경기 적게 배정할 r명 중 남자 수(fm)로 가능한 값 목록.
-   * 남자 출전 합 men × games − fm, 여자 출전 합 women × games − (r − fm)이 모두 짝수여야 한다.
-   */
-  function fewerSplits(men, women, games, r) {
-    var out = [];
-    for (var fm = 0; fm <= r; fm++) {
-      var fw = r - fm;
-      if (fm > men || fw > women) continue;
-      if ((men * games - fm) % 2 === 0 && (women * games - fw) % 2 === 0) out.push(fm);
-    }
-    return out;
-  }
-
-  // 앞에서부터 k개를 난수로 고른다 (Fisher–Yates 부분 섞기)
-  function pickSome(list, k, rng) {
-    var a = list.slice();
-    for (var i = 0; i < k; i++) {
-      var j = i + Math.floor(rng() * (a.length - i));
-      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
-    }
-    return a.slice(0, k);
-  }
-
-  /*
-   * 6.5: 1경기 적게 배정할 r명 (개정 3).
-   * 성별 나눔(남 fm명·여 r−fm명)은 짝수 조건으로 계산해 정하고, 가능한 나눔이 여럿이면 그중 하나를 난수로,
-   * 각 성별 안에서 누구인지는 난수로 고른다. 대진 생성과 다른 난수 줄기를 써서 r = 0일 때 생성 결과에 영향을 주지 않는다.
-   * 가능한 나눔이 없으면 ok: false (어떤 대진도 불가능).
-   */
-  function pickFewer(gd, r, games, seed) {
-    if (r === 0) return { ok: true, fewer: [] };
-    var men = [], women = [];
-    gd.forEach(function (g, i) { (g === "남" ? men : women).push(i); });
-    var splits = fewerSplits(men.length, women.length, games, r);
-    if (!splits.length) return { ok: false, fewer: [] };
-    var rng = makeRng((seed ^ 0x9E3779B9) >>> 0);
-    var fm = splits.length === 1 ? splits[0] : splits[Math.floor(rng() * splits.length)];
-    var chosen = pickSome(men, fm, rng).concat(pickSome(women, r - fm, rng));
-    return { ok: true, fewer: chosen.sort(function (a, b) { return a - b; }) };
-  }
-
-  /*
-   * 대진 탐색을 만든다. 화면이 멈추지 않도록 step(밀리초)을 여러 번 불러 조금씩 진행한다.
-   * 나눠 실행해도 난수 순서는 같으므로 결과는 같다.
-   * roster: sortRoster로 정렬한 [{name, gender, grade}]
-   */
-  function createSearch(roster, courts, games, seed) {
-    var n = roster.length;
-    var plan = computePlan(n, courts, games);
-    var sc = roster.map(function (p) { return GRADE_SCORE[p.grade]; });
-    var gd = roster.map(function (p) { return p.gender; });
-    var picked = pickFewer(gd, plan.r, games, seed);
-    var fewer = picked.fewer;
-    var target = roster.map(function (_, i) { return fewer.indexOf(i) >= 0 ? games - 1 : games; });
-    var rng = makeRng(seed);
-    // 성별마다 출전 횟수 합이 홀수면 어떤 대진도 불가능하므로 시도하지 않는다 (판정만 하고 난수는 쓰지 않음)
-    var parity = { "남": 0, "여": 0 };
-    target.forEach(function (g, i) { parity[gd[i]] += g; });
-    var parityFail = !picked.ok || parity["남"] % 2 !== 0 || parity["여"] % 2 !== 0;
-    var state = { tries: 0, found: 0, best: null, bestScore: null, done: plan.nSlots === 0 || parityFail };
-
-    function step(budgetMs) {
-      var until = Date.now() + budgetMs;
-      while (!state.done && Date.now() < until) {
-        state.tries += 1;
-        var s = tryBuild(sc, gd, target, plan, rng);
-        if (s) {
-          state.found += 1;
-          var score = repeatOpponentPairs(s);            // 6.4: 같은 상대 반복이 가장 적은 해
-          if (state.best === null || score < state.bestScore) { state.best = s; state.bestScore = score; }
-          if (state.found >= SOLUTIONS_TO_COMPARE) state.done = true;
-        }
-        if (state.tries >= MAX_RESTARTS) state.done = true;
-      }
-      return { done: state.done, tries: state.tries, found: state.found, maxTries: MAX_RESTARTS };
-    }
-
-    function result() {
-      return {
-        ok: state.best !== null,
-        matches: state.best || [],
-        repeatOpp: state.bestScore,
-        found: state.found,
-        tries: state.tries,
-        fewer: fewer,
-        parityFail: parityFail,
-        plan: plan,
-        seed: seed,
-        version: SCHEDULER_VERSION
-      };
-    }
-
-    return { step: step, result: result };
-  }
-
-  // ── 참가자별 참가 시각 (6.6, 1.2.0) ─────────────────────────
-  // 아래 함수는 늦게 온 사람이 1명 이상일 때만 쓴다. 없으면 createSearchTimed가 위의 createSearch(1.1.0)를 그대로 부른다.
-  var TARGET_SALT = 0x85EBCA6B;   // 목표 계산 난수 줄기 (대진 생성 난수·6.5 난수와 다름)
-
-  // "HH:MM"(두 자리 시:분, 00:00–23:59)만 분으로 바꾼다. 그 밖은 null (추측하지 않음)
-  function parseHM(s) {
-    var m = /^(\d{2}):(\d{2})$/.exec(String(s == null ? "" : s).trim());
-    if (!m) return null;
-    var h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
-    return h <= 23 && mi <= 59 ? h * 60 + mi : null;
-  }
-
-  /*
-   * 6.6 정의: 시간대 수 S(전원 정시 기준, computePlan 그대로), 사람마다 첫 가능 시간대 f, 남은 시간대 m, 최소 L, 상한 U.
-   * 참가 시각이 비었거나 시작 시각 이전·같으면 정시 (자정 넘김은 다루지 않음).
-   * timing: {start: "HH:MM", minutes}
-   */
-  function arrivalInfo(roster, courts, games, timing) {
-    var plan = computePlan(roster.length, courts, games);
-    var S = plan.nSlots;
-    var start = parseHM(timing && timing.start);
-    var d = timing ? timing.minutes : 0;
-    var people = roster.map(function (p, i) {
-      var a = parseHM(p.arrival);
-      if (start === null || a === null || a <= start) return { index: i, late: false, f: 0, m: S };
-      var f = 0;
-      while (f < S && start + f * d < a) f++;   // 시간대 시작 시각 ≥ 참가 시각인 가장 이른 시간대
-      var m = S - f;
-      return {
-        index: i, late: true, arrival: String(p.arrival).trim(), arrivalMin: a, f: f, m: m,
-        L: S > 0 ? Math.floor(games * m / S) : 0,        // 내림
-        U: Math.min(games, Math.ceil(m / 2))             // 연속 금지로 m개 시간대에서 최대 ⌈m/2⌉경기
-      };
-    });
-    return { plan: plan, S: S, people: people, late: people.filter(function (p) { return p.late; }) };
-  }
-
-  // 시간대 0 … a−1에 넣을 수 있는 최대 경기 수 Q(a) (a = 0 … S). 시간대마다 ≤ 코트 수, ≤ ⌊와 있는 사람/4⌋,
-  // 이어진 두 시간대 합 ≤ ⌊뒤 시간대에 와 있는 사람/4⌋ (연속 금지라 두 시간대의 선수가 겹치지 않음)
-  function frontCapacity(people, S, C) {
-    var A = [], t, x, y;
-    for (t = 0; t < S; t++) A.push(people.filter(function (p) { return p.f <= t; }).length);
-    var Q = [0];
-    var dp = null;   // dp[x] = 시간대 t에 x경기일 때 0…t의 최대 합
+    var spareAfter = [];
     for (t = 0; t < S; t++) {
-      var cap = Math.min(C, Math.floor(A[t] / 4));
-      var next = [];
-      for (x = 0; x <= C; x++) {
-        if (x > cap) { next.push(-Infinity); continue; }
-        if (!dp) { next.push(x); continue; }
-        var best = -Infinity;
-        for (y = 0; y <= C; y++) if (dp[y] > -Infinity && x + y <= Math.floor(A[t] / 4)) best = Math.max(best, dp[y] + x);
-        next.push(best);
-      }
-      dp = next;
-      Q.push(Math.max.apply(null, dp));
-    }
-    return Q;
-  }
-
-  // 2.2 자리 검사 A·B (필요 조건만): 이 목표라면 들어갈 자리가 아예 없는지
-  function roomOk(g, people, S, C, Q) {
-    var a, i, sum = 0;
-    for (i = 0; i < g.length; i++) sum += g[i];
-    for (a = 1; a < S; a++) {
-      var D = 0;
-      for (i = 0; i < people.length; i++) D += Math.max(0, g[i] - Math.ceil(Math.max(0, a - people[i].f) / 2));
-      if (D > 4 * C * (S - a)) return false;                       // 검사 A: 뒤쪽 자리
-      if (Math.ceil(sum / 4) > Q[a] + C * (S - a)) return false;   // 검사 B: 앞쪽 인원
-    }
-    return true;
-  }
-
-  /*
-   * 6.6 목표 경기 수 (plan_w5.md 2.2, Q-W5-1 (가)).
-   * 단계 1: 정시 k, 늦게 L → 단계 2: 자리 검사를 통과하는 한 늦게 온 사람을 U까지 1경기씩 채움
-   * → 단계 3: 4의 배수·성별 짝수를 늦게 온 사람의 더한 경기를 되돌려 맞추고, 안 되면 정시 참가자만 6.5 방식으로 1경기 적게.
-   * 개수(총 경기 수, 누가 몇 경기의 개수)는 대진 번호와 관계없고, 대진 번호는 같은 조건인 사람 중 누구인지만 정한다.
-   * reason: null(성공) | "zeroMin"(L = 0인 사람) | "noRoom"(단계 1부터 자리 없음 또는 L > U) | "parity"(짝수 조건 실패)
-   */
-  function lateTargets(roster, courts, games, seed, timing) {
-    var info = arrivalInfo(roster, courts, games, timing);
-    var people = info.people, S = info.S, C = courts;
-    var gd = roster.map(function (p) { return p.gender; });
-    var out = { info: info, reason: null, start: null, filled: null, target: null, fewer: [], adjusted: [], total: 0 };
-    var g = people.map(function (p) { return p.late ? p.L : games; });
-    out.start = g.slice();
-    if (info.late.some(function (p) { return p.L === 0; })) { out.reason = "zeroMin"; return out; }
-    var Q = frontCapacity(people, S, C);
-    if (info.late.some(function (p) { return p.L > p.U; }) || !roomOk(g, people, S, C, Q)) { out.reason = "noRoom"; return out; }
-
-    var rng = makeRng((seed ^ TARGET_SALT) >>> 0);
-    var rank = {};
-    shuffle(info.late.map(function (p) { return p.index; }), rng).forEach(function (i, r) { rank[i] = r; });
-    // 넘침 e = g − k·m/S 를 S배 한 정수로 비교한다 (소수 오차 없이)
-    function over(i) { return g[i] * S - games * people[i].m; }
-
-    // 단계 2 — 채우기: 넘침이 작은 사람 → 먼저 온 사람 → 대진 번호 순서
-    var blocked = {};
-    for (;;) {
-      var cands = info.late.filter(function (p) { return g[p.index] < p.U && !blocked[p.index]; })
-        .map(function (p) { return p.index; })
-        .sort(function (a, b) { return (over(a) - over(b)) || (people[a].arrivalMin - people[b].arrivalMin) || (rank[a] - rank[b]); });
-      var added = false;
-      for (var ci = 0; ci < cands.length && !added; ci++) {
-        g[cands[ci]] += 1;
-        if (roomOk(g, people, S, C, Q)) added = true;
-        else { g[cands[ci]] -= 1; blocked[cands[ci]] = true; }   // 검사는 g가 늘수록 어려워지므로 다시 볼 필요 없음
-      }
-      if (!added) break;
-    }
-    out.filled = g.slice();
-
-    // 단계 3 — 4의 배수·성별 짝수
-    var sums = { "남": 0, "여": 0 };
-    g.forEach(function (v, i) { sums[gd[i]] += v; });
-    var total = sums["남"] + sums["여"];
-    if (total % 4 !== 0 || sums["남"] % 2 !== 0 || sums["여"] % 2 !== 0) {
-      // 3-1: 늦게 온 사람의 더한 경기 되돌리기. 넘침이 큰 사람 → 늦게 온 사람 → 대진 번호 순서
-      var giveBack = function (gender) {
-        return info.late.filter(function (p) { return gd[p.index] === gender && g[p.index] > p.L; })
-          .map(function (p) { return p.index; })
-          .sort(function (a, b) { return (over(b) - over(a)) || (people[b].arrivalMin - people[a].arrivalMin) || (rank[a] - rank[b]); });
-      };
-      var gm = giveBack("남"), gw = giveBack("여");
-      var opts = [];
-      for (var dm = 0; dm <= 3; dm++) {
-        for (var dw = 0; dw <= 3; dw++) {
-          if (dm > gm.length || dw > gw.length) continue;
-          if ((sums["남"] - dm) % 2 !== 0 || (sums["여"] - dw) % 2 !== 0 || (total - dm - dw) % 4 !== 0) continue;
-          var who = gm.slice(0, dm).concat(gw.slice(0, dw));
-          opts.push({ cost: dm + dw, excess: who.reduce(function (s, i) { return s + over(i); }, 0), who: who });
-        }
-      }
-      if (opts.length) {
-        var minCost = Math.min.apply(null, opts.map(function (o) { return o.cost; }));
-        opts = opts.filter(function (o) { return o.cost === minCost; });
-        var maxEx = Math.max.apply(null, opts.map(function (o) { return o.excess; }));
-        opts = opts.filter(function (o) { return o.excess === maxEx; });
-        var pick = opts.length === 1 ? opts[0] : opts[Math.floor(rng() * opts.length)];
-        pick.who.forEach(function (i) { g[i] -= 1; });
-        out.adjusted = pick.who.slice().sort(function (a, b) { return a - b; });
-      } else {
-        // 3-2: 늦게 온 사람은 그대로, 정시 참가자만 6.5 방식 (성별 나눔은 계산, 성별 안에서는 대진 번호 난수)
-        var r = total % 4;
-        var onMen = [], onWomen = [];
-        people.forEach(function (p, i) { if (!p.late) (gd[i] === "남" ? onMen : onWomen).push(i); });
-        var splits = [];
-        for (var fm = 0; fm <= r; fm++) {
-          var fw = r - fm;
-          if (fm > onMen.length || fw > onWomen.length) continue;
-          if ((sums["남"] - fm) % 2 === 0 && (sums["여"] - fw) % 2 === 0) splits.push(fm);
-        }
-        if (!splits.length) { out.reason = "parity"; out.target = g.slice(); return out; }   // 3-3
-        var cm = splits.length === 1 ? splits[0] : splits[Math.floor(rng() * splits.length)];
-        out.fewer = pickSome(onMen, cm, rng).concat(pickSome(onWomen, r - cm, rng)).sort(function (a, b) { return a - b; });
-        out.fewer.forEach(function (i) { g[i] -= 1; });
-      }
-    }
-    out.target = g;
-    out.total = g.reduce(function (s, v) { return s + v; }, 0) / 4;
-    return out;
-  }
-
-  /*
-   * 2.2 단계 4: tryBuild(1.1.0)와 같은 방식에 두 가지만 다르다.
-   * ① 시간대 t에서 첫 가능 시간대 first[p] > t인 사람은 뽑지 않고, 남은 경기를 채울 수 있는지 셀 때 그 사람은 first[p]부터 센다.
-   * ② 시간대별 경기 수는 고르게 나눠 섞되, 그때 와 있는 사람으로 못 넣는 경기는 다음 시간대로 넘긴다(코트 수 안에서).
-   */
-  function tryBuildLate(sc, gd, target, first, nSlots, courts, totalGames, rng) {
-    var n = sc.length;
-    var base = Math.floor(totalGames / nSlots), extra = totalGames - base * nSlots;
-    var ks = [], t, p, u;
-    for (t = 0; t < extra; t++) ks.push(base + 1);
-    for (t = extra; t < nSlots; t++) ks.push(base);
-    shuffle(ks, rng);
-    var spareAfter = [];                                          // 시간대 t 뒤에 더 넣을 수 있는 경기 수
-    for (t = 0; t < nSlots; t++) {
       var sp = 0;
-      for (u = t + 1; u < nSlots; u++) sp += courts - ks[u];
+      for (u = t + 1; u < S; u++) sp += ctx.slotCap[u] - loads[u];
       spareAfter.push(sp);
     }
-
-    var remaining = target.slice();
-    var last = [];
-    for (p = 0; p < n; p++) last.push(-99);
-    var partners = new Set();
-    var schedule = [];
     var carry = 0;
 
-    for (t = 0; t < nSlots; t++) {
-      var left = nSlots - t;
+    for (t = fromSlot; t < S; t++) {
+      var urgent = new Set(), eligible = [];
       for (p = 0; p < n; p++) {
-        var cap = first[p] > t ? Math.ceil((nSlots - first[p]) / 2)
-          : (last[p] === t - 1 ? Math.ceil((left - 1) / 2) : Math.ceil(left / 2));
-        if (remaining[p] > cap) return null;
+        if (remaining[p] <= 0) continue;
+        if (t > l[p]) return null;
+        if (f[p] > t) { if (remaining[p] > maxPlays(l[p] - f[p] + 1, 0)) return null; continue; }
+        if (remaining[p] > maxPlays(l[p] - t + 1, run[p])) return null;
+        if (remaining[p] > maxPlays(l[p] - t, 0)) urgent.add(p);       // 이번에 쉬면 남은 경기를 못 채움
+        if (run[p] < 2) eligible.push(p);
       }
-      var eligible = [];
-      for (p = 0; p < n; p++) if (first[p] <= t && remaining[p] > 0 && last[p] !== t - 1) eligible.push(p);
-      var urgent = new Set();
-      eligible.forEach(function (x) { if (remaining[x] > Math.ceil((left - 1) / 2)) urgent.add(x); });
-      var want = Math.min(courts, ks[t] + carry, Math.floor(eligible.length / 4));
-      var need = Math.ceil(urgent.size / 4);
-      if (need > want) return null;
+      var want, kmin;
+      if (flexible) {
+        want = Math.min(ctx.slotCap[t], loads[t] + carry, Math.floor(eligible.length / 4));
+        kmin = Math.ceil(urgent.size / 4);
+      } else {
+        want = kmin = loads[t];
+        if (urgent.size > 4 * want || eligible.length < 4 * want) return null;
+      }
+      if (kmin > want) return null;
 
+      // 직전에 쉰 사람(과 이번에 꼭 뛰어야 하는 사람)만으로 먼저 채워 보고, 안 되면 직전에 뛴 사람도 넣는다 (2연속 최소, plan 2.4)
+      var rested = eligible.filter(function (x) { return run[x] === 0 || urgent.has(x); });
       var slotMatches = null;
-      for (var k = want; k >= need && !slotMatches; k--) {        // 못 넣으면 한 경기 줄여 다음 시간대로 넘긴다
+      for (var k = want; k >= kmin && !slotMatches; k--) {
         if (k === 0) { slotMatches = []; break; }
-        for (var attempt = 0; attempt < SLOT_ATTEMPTS; attempt++) {
-          var keyed = eligible.map(function (x, idx) {
-            return { p: x, u: urgent.has(x) ? 0 : 1, v: -remaining[x] + rng() * 1.5, idx: idx };
+        var restedFirst = rested.length >= 4 * k && rested.length < eligible.length ? RESTED_ATTEMPTS : 0;
+        for (var attempt = 0; attempt < restedFirst + SLOT_ATTEMPTS; attempt++) {
+          var keyed = (attempt < restedFirst ? rested : eligible).map(function (x, idx) {
+            // 여유 = 이번에 쉬어도 2연속 없이 뛸 수 있는 경기 수 − 남은 경기 (작을수록 먼저). 정수 사이를 난수로 섞는다
+            return { p: x, u: urgent.has(x) ? 0 : 1, r: run[x] === 0 ? 0 : 1 + doubles[x],
+              v: Math.ceil((l[x] - t) / 2) - remaining[x] + rng() * 0.99, idx: idx };
           });
-          keyed.sort(function (A, B) { return (A.u - B.u) || (A.v - B.v) || (A.idx - B.idx); });
+          keyed.sort(function (A, B) { return (A.u - B.u) || (A.r - B.r) || (A.v - B.v) || (A.idx - B.idx); });
           var order = keyed.map(function (o) { return o.p; });
           var used = new Set();
           var ms = [];
@@ -597,67 +454,151 @@
         }
       }
       if (!slotMatches) return null;
-      carry = ks[t] + carry - slotMatches.length;
-      if (carry > spareAfter[t]) return null;
+      if (flexible) {
+        carry = loads[t] + carry - slotMatches.length;
+        if (carry > spareAfter[t]) return null;
+      }
 
+      var playing = {};
       slotMatches.forEach(function (m, ci) {
         schedule.push({ slot: t, court: ci + 1, t1: m.t1, t2: m.t2, type: m.type });
         partners.add(pairKey(m.t1[0], m.t1[1]));
         partners.add(pairKey(m.t2[0], m.t2[1]));
-        m.t1.concat(m.t2).forEach(function (x) { remaining[x] -= 1; last[x] = t; });
+        m.t1.concat(m.t2).forEach(function (x) { playing[x] = true; });
       });
+      for (p = 0; p < n; p++) {
+        if (playing[p]) { remaining[p] -= 1; if (run[p] >= 1) doubles[p] += 1; run[p] += 1; } else run[p] = 0;
+      }
+      actual.push(slotMatches.length);
     }
     for (p = 0; p < n; p++) if (remaining[p]) return null;
-    return schedule;
+    // ⓗ 2연속 공평: 사람 간 차이 ≤ 1
+    if (Math.max.apply(null, doubles) - Math.min.apply(null, doubles) > 1) return null;
+    return { schedule: schedule, loads: actual, doubles: doubles };
+  }
+
+  function repeatOpponentPairs(schedule) {
+    var cnt = new Map();
+    schedule.forEach(function (m) {
+      m.t1.forEach(function (a) {
+        m.t2.forEach(function (b) {
+          var key = pairKey(a, b);
+          cnt.set(key, (cnt.get(key) || 0) + 1);
+        });
+      });
+    });
+    var c = 0;
+    cnt.forEach(function (v) { if (v >= 2) c++; });
+    return c;
+  }
+
+  // 해 비교 (6.5 우선순위 → 6.7): 부하 목록이 앞에서부터 큰 것 → 2연속 총 횟수가 적은 것 → 같은 상대 반복 쌍이 적은 것
+  function better(a, b) {
+    for (var i = 0; i < a.loads.length; i++) if (a.loads[i] !== b.loads[i]) return a.loads[i] > b.loads[i];
+    if (a.totalDoubles !== b.totalDoubles) return a.totalDoubles < b.totalDoubles;
+    return a.repeatOpp < b.repeatOpp;
   }
 
   /*
-   * 화면이 부르는 대진 탐색 (1.2.0). 늦게 온 사람이 없으면 createSearch(1.1.0)를 그대로 돌려준다 → 난수 순서까지 같음.
-   * timing: {start: "HH:MM", minutes}. roster의 각 사람에 arrival("HH:MM" 또는 빈칸)이 있을 수 있다
+   * 대진 탐색. 화면이 멈추지 않도록 step(밀리초)을 여러 번 불러 조금씩 진행한다 (나눠 실행해도 결과는 같다).
+   * roster: sortRoster로 정렬한 [{name, gender, grade, arrival, leave}]
+   * settings: {start, end, minutes, courts, maxGames}
+   * opts(W7, plan 2.8): {fixed: {matches, fromSlot}} — 2.0.0의 화면은 넘기지 않는다
    */
-  function createSearchTimed(roster, courts, games, seed, timing) {
-    var info = arrivalInfo(roster, courts, games, timing);
-    if (!info.late.length) return createSearch(roster, courts, games, seed);
-
-    var tg = lateTargets(roster, courts, games, seed, timing);
-    var sc = roster.map(function (p) { return GRADE_SCORE[p.grade]; });
+  function createSearch(roster, settings, seed, opts) {
+    opts = opts || {};
+    var pl = plan(roster, settings, seed);
+    var iv = pl.iv;
     var gd = roster.map(function (p) { return p.gender; });
-    var first = info.people.map(function (p) { return p.f; });
+    var ctx = {
+      n: roster.length, S: iv.S,
+      f: iv.people.map(function (p) { return p.f; }), l: iv.people.map(function (p) { return p.l; }),
+      sc: roster.map(function (p) { return GRADE_SCORE[p.grade]; }), gd: gd,
+      slotCap: pl.ub.caps.slotCap, fixed: opts.fixed || null
+    };
     var rng = makeRng(seed);
-    var state = { tries: 0, found: 0, best: null, bestScore: null, done: info.S === 0 || tg.reason !== null };
+    var reductions = pl.parityDrops.map(function (M) { return { from: M, to: M - 1, reason: "parity" }; });
+    var state = {
+      M: pl.M, quota: pl.quota, loads: pl.loads, levelTries: 0, totalTries: 0, drops: 0, draw: 0,
+      found: 0, best: null, done: pl.M <= 0, failReason: pl.M <= 0 ? pl.reason : null, tried: pl.M > 0 ? [pl.M] : []
+    };
+
+    function nextLevel() {
+      state.drops += 1;
+      if (state.drops > MAX_SEARCH_DROPS || state.totalTries >= MAX_TOTAL_TRIES) { state.done = true; state.failReason = "search"; return; }
+      var M = state.M - 1;
+      reductions.push({ from: state.M, to: M, reason: "search" });
+      while (M > 0) {
+        var qt = quotas(iv, gd, M, seed);
+        if (qt.ok) break;
+        reductions.push({ from: M, to: M - 1, reason: "parity" });
+        M -= 1;
+      }
+      if (M <= 0) { state.done = true; state.failReason = "search"; return; }
+      state.M = M;
+      state.quota = quotas(iv, gd, M, seed);
+      state.loads = lexLoads(pl.ub, iv.S, M);
+      state.levelTries = 0;
+      state.draw = 0;
+      state.tried.push(M);
+    }
 
     function step(budgetMs) {
       var until = Date.now() + budgetMs;
       while (!state.done && Date.now() < until) {
-        state.tries += 1;
-        var s = tryBuildLate(sc, gd, tg.target, first, info.S, courts, tg.total, rng);
+        // 아직 하나도 못 찾았으면 몫 동점(누가 ⌈q⌉를 받는지)을 다시 뽑아 다른 배정으로 시도한다
+        if (!state.found && state.levelTries > 0 && state.levelTries % QUOTA_REDRAW === 0) {
+          state.draw += 1;
+          var qd = quotas(iv, gd, state.M, seed, state.draw);
+          if (qd.ok) state.quota = qd;
+        }
+        state.levelTries += 1;
+        state.totalTries += 1;
+        var flexible = state.levelTries > STRICT_TRIES;
+        var s = tryBuild(ctx, state.quota.target, state.loads, flexible, rng);
         if (s) {
           state.found += 1;
-          var score = repeatOpponentPairs(s);            // 6.4
-          if (state.best === null || score < state.bestScore) { state.best = s; state.bestScore = score; }
-          if (state.found >= SOLUTIONS_TO_COMPARE) state.done = true;
+          var cand = {
+            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles,
+            totalDoubles: s.doubles.reduce(function (a, b) { return a + b; }, 0) / 1,
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota, strict: !flexible
+          };
+          if (state.best === null || better(cand, state.best)) state.best = cand;
+          if (state.found >= SOLUTIONS_TO_COMPARE) { state.done = true; break; }
         }
-        if (state.tries >= MAX_RESTARTS) state.done = true;
+        if (state.levelTries >= TRIES_PER_M) {
+          if (state.found > 0) state.done = true;
+          else nextLevel();
+        } else if (state.totalTries >= MAX_TOTAL_TRIES) {
+          state.done = true;
+          if (!state.found) state.failReason = "search";
+        }
       }
-      return { done: state.done, tries: state.tries, found: state.found, maxTries: MAX_RESTARTS };
+      return { done: state.done, tries: state.totalTries, found: state.found, maxTries: MAX_TOTAL_TRIES, M: state.M };
     }
 
     function result() {
+      var b = state.best;
       return {
-        ok: state.best !== null,
-        matches: state.best || [],
-        repeatOpp: state.bestScore,
+        ok: b !== null,
+        matches: b ? b.matches : [],
+        M: b ? b.M : 0,
+        loads: b ? b.loads : [],
+        doubles: b ? b.doubles : [],
+        totalDoubles: b ? b.totalDoubles : 0,
+        repeatOpp: b ? b.repeatOpp : null,
+        q: (b ? b.quota : pl.quota || {}).q || [],
+        target: (b ? b.quota : pl.quota || {}).target || [],
+        plannedLoads: state.loads,
+        upper: pl.ub.M,
+        ub: { full: pl.ub.full, bySlot: pl.ub.bySlot, byWindow: pl.ub.byWindow, byH: pl.ub.byH },
+        reductions: reductions,
+        tried: state.tried,
+        failReason: b ? null : state.failReason,
         found: state.found,
-        tries: state.tries,
-        fewer: tg.fewer,                                   // 1경기 적게 배정된 정시 참가자 (6.6 ④)
-        parityFail: tg.reason === "parity",
-        noRoom: tg.reason === "noRoom",
-        zeroMin: tg.reason === "zeroMin",
-        late: info.late.map(function (p) {
-          return { index: p.index, arrival: p.arrival, f: p.f, m: p.m, L: p.L, U: p.U, target: tg.target ? tg.target[p.index] : null };
-        }),
-        targetTotal: tg.total,
-        plan: info.plan,
+        tries: state.totalTries,
+        iv: iv,
+        S: iv.S,
         seed: seed,
         version: SCHEDULER_VERSION
       };
@@ -666,40 +607,27 @@
     return { step: step, result: result };
   }
 
-  // 5절 상충 안내 + 참가 시각. 늦게 온 사람이 있으면 성별 짝수 안내만 6.6 목표 계산 결과로 판정한다 (그 밖은 그대로)
-  function checkFeasibilityTimed(roster, courts, games, timing, seed) {
-    var warns = checkFeasibility(roster, courts, games);
-    var info = arrivalInfo(roster, courts, games, timing);
-    if (!info.late.length || info.S === 0) return warns;
-    var tg = lateTargets(roster, courts, games, seed || 0, timing);
-    warns = warns.filter(function (w) { return w.reason.indexOf("남자 출전 횟수 합(") !== 0; });
-    if (tg.reason === "parity") {
-      warns.push({
-        reason: "늦게 오는 사람의 경기 수를 조절하고 정시 참가자를 1경기 적게 해도 남자 또는 여자의 출전 횟수 합을 짝수로 만들 수 없습니다. 한 경기에 남자·여자는 0·2·4명씩 들어가기 때문입니다.",
-        fix: "1인당 경기 수를 바꿔 보세요."
-      });
-    }
-    return warns;
-  }
-
   global.Scheduler = {
     SCHEDULER_VERSION: SCHEDULER_VERSION,
     GRADE_SCORE: GRADE_SCORE,
-    PLAYERS_PER_COURT_RULE: PLAYERS_PER_COURT_RULE,
     MAX_GRADE_DIFF: MAX_GRADE_DIFF,
-    MAX_RESTARTS: MAX_RESTARTS,
     SOLUTIONS_TO_COMPARE: SOLUTIONS_TO_COMPARE,
+    TRIES_PER_M: TRIES_PER_M,
+    MAX_SEARCH_DROPS: MAX_SEARCH_DROPS,
+    MAX_TOTAL_TRIES: MAX_TOTAL_TRIES,
     sortRoster: sortRoster,
-    recommendedCourts: recommendedCourts,
-    computePlan: computePlan,
-    checkFeasibility: checkFeasibility,
-    slotTime: slotTime,
-    createSearch: createSearch,
-    // 1.2.0 (6.6)
     parseHM: parseHM,
-    arrivalInfo: arrivalInfo,
-    lateTargets: lateTargets,
-    createSearchTimed: createSearchTimed,
-    checkFeasibilityTimed: checkFeasibilityTimed
+    fmtHM: fmtHM,
+    slotTime: slotTime,
+    slots: slots,
+    maxPlays: maxPlays,
+    intervals: intervals,
+    loadCaps: loadCaps,
+    upperBound: upperBound,
+    lexLoads: lexLoads,
+    quotas: quotas,
+    needsDoubles: needsDoubles,
+    plan: plan,
+    createSearch: createSearch
   };
 })(this);

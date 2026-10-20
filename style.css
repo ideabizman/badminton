@@ -111,9 +111,15 @@ th { background: var(--head); }
 table.roster td input { width: 100%; min-width: 90px; }
 table.roster td.warn { color: var(--warn); text-align: left; font-size: 0.9rem; min-width: 120px; }
 table.roster td.num { color: var(--muted); width: 2.5em; }
-table.roster td input.arrival { min-width: 70px; width: 6.5em; }
-#result-late table { width: auto; }
+table.roster td select.time { min-width: 7em; }
+#result-iv table { width: auto; }
 .late-line { color: var(--primary); font-weight: bold; margin: 4px 0; }
+.summary-line { font-weight: bold; margin: 4px 0 8px; }
+.preview-table th { text-align: left; white-space: nowrap; }
+.preview-table td.left { text-align: left; }
+.seed-row { margin-top: 12px; }
+table.grid td.noslot { color: #808080; background: #f2f2f2; font-weight: bold; }
+.dbl { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 4px; background: var(--warn-bg); color: var(--warn); font-size: 0.85rem; font-weight: bold; }
 
 .summary { margin: 12px 0; }
 .summary table { width: auto; }
