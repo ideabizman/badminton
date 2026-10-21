@@ -226,5 +226,134 @@
       info: { S: S, loads: loads, empty: empty, totalDoubles: totalD, doubles: dbl, games: games, q: q, per: per } };
   }
 
-  global.Checker = { check: check };
+  // ── 재편성 결과 점검 (CLAUDE.md 6.8.5, plan_w7.md 2.11) ─────────────
+  // 3연속 금지에서 이어진 n칸에 직전 연속 run(0·1·2)으로 할 수 있는 최대 경기 수 (scheduler.js와 따로, 칸마다 세어 봄)
+  function most(n, run) {
+    var best = 0;
+    // 작은 n이므로 "뛸 수 있으면 뛴다"를 그대로 세지 않고, 모든 출전 무늬 중 최대를 센다
+    var lim = Math.min(n, 16);
+    for (var mask = 0; mask < (1 << lim); mask++) {
+      var r = run, cnt = 0, ok = true;
+      for (var i = 0; i < lim; i++) {
+        if (mask & (1 << i)) { if (r >= 2) { ok = false; break; } r++; cnt++; } else r = 0;
+      }
+      if (ok && cnt > best) best = cnt;
+    }
+    if (n > lim) best += (n - lim) - Math.floor((n - lim) / 3);   // 16칸 넘는 일은 없지만 대비
+    return best;
+  }
+
+  /*
+   * λ와 남은 몫 ρ (6.8.4). scheduler.js와 다른 방법: 실수 이분법으로 가운데 묶음을 찾고, 그 묶음으로 정확한 분수를 푼다.
+   * ppl: {이름: {m, g0, H}}, M: 남은 경기 수 → {lam: {n, d}, rho: {이름: {n, d}}}
+   */
+  function restShares(ppl, M) {
+    var names = Object.keys(ppl).filter(function (k) { return ppl[k].H > 0 && ppl[k].m > 0; });
+    var want = 4 * M;
+    function F(l) { return names.reduce(function (s, k) { var p = ppl[k]; return s + Math.max(0, Math.min(l * p.m - p.g0, p.H)); }, 0); }
+    var lo = 0, hi = 1;
+    while (F(hi) < want - EPS && hi < 1e6) hi *= 2;
+    for (var it = 0; it < 200; it++) { var mid = (lo + hi) / 2; if (F(mid) >= want - 1e-12) hi = mid; else lo = mid; }
+    var lam = hi;
+    var top = 0, gB = 0, mB = 0, B = {};
+    names.forEach(function (k) {
+      var p = ppl[k], v = lam * p.m - p.g0;
+      if (v >= p.H - 1e-9) top += p.H;
+      else if (v > 1e-9) { B[k] = true; gB += p.g0; mB += p.m; }
+    });
+    var L = mB > 0 ? { n: want - top + gB, d: mB } : null;
+    if (!L) {
+      // 가운데 묶음이 없으면 F가 평평한 구간: 모두 0 또는 H′. 가장 작은 λ = 꺾이는 점 하나로 둔다(ρ와 무관)
+      var best = null;
+      names.forEach(function (k) { var p = ppl[k]; var b = { n: p.g0 + p.H, d: p.m }; if (b.n * 1 / b.d <= lam + 1e-9 && (!best || b.n * best.d > best.n * b.d)) best = b; });
+      L = best || { n: 0, d: 1 };
+    }
+    var rho = {};
+    Object.keys(ppl).forEach(function (k) {
+      var p = ppl[k];
+      if (!(p.H > 0 && p.m > 0)) { rho[k] = { n: 0, d: 1 }; return; }
+      var v = L.n * p.m - p.g0 * L.d;
+      rho[k] = { n: Math.max(0, Math.min(v, p.H * L.d)), d: L.d };
+    });
+    return { lam: L, rho: rho };
+  }
+
+  /*
+   * roster: 변동 반영 뒤 명단 [{name, gender, grade, arrival, leave}] (새로 온 사람 포함, 불참(지난 경기 없음)은 뺀 것)
+   * baseRows: 바탕 대진표 행 (시간 글자) — 고정 시간대 0…T의 비교(ⓘ)와 g0 계산에 쓴다
+   * rows: 재편성 결과 하루 전체 행, opts: 설정, T: 기준 시간대 번호
+   * 돌려주는 값: check()와 같은 모양 (items: ⓐ ⓑ ⓒ ⓓ′ ⓔ ⓕ ⓖ ⓗ′ ⓘ)
+   */
+  function checkRest(roster, baseRows, rows, opts, T) {
+    var all = check(roster, rows, opts);           // ⓐ ⓑ ⓒ ⓔ ⓕ ⓖ는 하루 전체 대진·바뀐 구간 그대로
+    var fr = frame(roster, opts), per = fr.per;
+    var names = roster.map(function (p) { return p.name; });
+    function slotOf(time) { return Math.round((((hm(time) - fr.start) % 1440) + 1440) % 1440 / fr.minutes); }
+    function timeOf(s) { return fmt(fr.start + s * fr.minutes); }
+    function people(m) { return m.t1.concat(m.t2); }
+    var on = {};
+    names.forEach(function (n) { on[n] = {}; });
+    rows.forEach(function (m) { people(m).forEach(function (p) { if (on[p]) on[p][slotOf(m.time)] = true; }); });
+    var baseOn = {};
+    names.forEach(function (n) { baseOn[n] = {}; });
+    baseRows.forEach(function (m) { var s = slotOf(m.time); if (s <= T) people(m).forEach(function (p) { if (baseOn[p]) baseOn[p][s] = true; }); });
+    // 사람마다 g0·run(바탕 기준)·m′·H′
+    var ppl = {};
+    names.forEach(function (n) {
+      var v = per[n], g0 = 0, run = 0;
+      for (var t = 0; t <= T; t++) { if (baseOn[n][t]) { g0++; run++; } else run = 0; }
+      var fr2 = Math.max(v.f, T + 1), mr = Math.max(0, v.l - fr2 + 1);
+      var H = most(mr, fr2 === T + 1 ? run : 0);
+      if (opts.maxGames) H = Math.min(H, opts.maxGames - g0);
+      ppl[n] = { m: v.m, g0: g0, H: Math.max(0, H), mRest: mr };
+    });
+    var restGames = {};
+    names.forEach(function (n) { restGames[n] = Object.keys(on[n]).filter(function (s) { return +s > T; }).length; });
+    var Mrest = rows.filter(function (m) { return slotOf(m.time) > T; }).length;
+    var sh = restShares(ppl, Mrest);
+
+    // ⓓ′ 남은 배정 rₚ ∈ {⌊ρ⌋, ⌈ρ⌉}
+    var dv = [];
+    names.forEach(function (n) {
+      var r = sh.rho[n], lo = Math.floor(r.n / r.d), hi = Math.ceil(r.n / r.d);
+      if (restGames[n] < lo || restGames[n] > hi) dv.push(n + "(남은 " + restGames[n] + "경기, 몫 " + (r.n / r.d).toFixed(3) + ")");
+    });
+    // ⓗ′ 남은 2연속(T·T+1 쌍부터)의 차이 — 남은 배정 1 이상인 사람끼리 (plan Q9)
+    var rd = {};
+    names.forEach(function (n) { var k = 0; for (var s = T; s < fr.S - 1; s++) if (on[n][s] && on[n][s + 1]) k++; rd[n] = k; });
+    var hv = names.filter(function (n) { return restGames[n] >= 1; }).map(function (n) { return rd[n]; });
+    var hmax = hv.length ? Math.max.apply(null, hv) : 0, hmin = hv.length ? Math.min.apply(null, hv) : 0;
+    var totalR = names.reduce(function (s, n) { return s + rd[n]; }, 0);
+    // ⓘ 고정 불변: 0…T 행이 바탕과 칸마다 같다 (시간·코트·네 사람·종류)
+    function key(m) { return [m.time, m.court, m.t1.join("·"), m.t2.join("·"), m.type].join("|"); }
+    var bk = baseRows.filter(function (m) { return slotOf(m.time) <= T; }).map(key).sort();
+    var rk = rows.filter(function (m) { return slotOf(m.time) <= T; }).map(key).sort();
+    var iv = [];
+    var bs = {}, rs = {};
+    bk.forEach(function (k) { bs[k] = (bs[k] || 0) + 1; });
+    rk.forEach(function (k) { rs[k] = (rs[k] || 0) + 1; });
+    Object.keys(bs).forEach(function (k) { if ((rs[k] || 0) < bs[k]) iv.push("바탕에만: " + k); });
+    Object.keys(rs).forEach(function (k) { if ((bs[k] || 0) < rs[k]) iv.push("결과에만: " + k); });
+
+    var pick = function (code) { return all.items.filter(function (x) { return x.code === code; })[0]; };
+    var items = [pick("ⓐ"), pick("ⓑ"), pick("ⓒ"),
+      { code: "ⓓ′", item: "남은 경기 수가 남은 몫에 맞음", rule: "⌊ρ⌋ 또는 ⌈ρ⌉ (λ = " + sh.lam.n + "/" + sh.lam.d + ")", count: dv.length, detail: dv.slice(0, SHOW).join(", ") },
+      pick("ⓔ"), pick("ⓕ"), pick("ⓖ"),
+      { code: "ⓗ′", item: "남은 시간대 2연속 횟수의 사람 간 차이 1 이하", rule: "최대 − 최소 ≤ 1 (남은 경기 1 이상인 사람)", count: hmax - hmin > 1 ? 1 : 0,
+        detail: "총 " + totalR + "회, 최소 " + hmin + "회 · 최대 " + hmax + "회" },
+      { code: "ⓘ", item: "진행된 시간대(" + timeOf(0) + "–" + timeOf(T + 1) + ")가 바탕과 같음", rule: "칸마다 같음", count: iv.length, detail: iv.slice(0, SHOW).join(", ") }];
+    var extra = all.extra.slice();
+    var dayTotal = names.map(function (n) {
+      var g = all.info.games[n], lm = (sh.lam.n * ppl[n].m) / sh.lam.d;
+      return n + " " + ppl[n].g0 + "+" + restGames[n] + "=" + g + " (λm " + lm.toFixed(2) + ")";
+    });
+    extra.push({ code: "참고", item: "하루 합계 (지금까지 + 남은 = 합계, λ × 참여 시간대)", rule: "판정 아님", count: rows.length, detail: dayTotal.slice(0, 12).join(", ") + (dayTotal.length > 12 ? " 외 " + (dayTotal.length - 12) + "명" : ""), info: true });
+    extra.push({ code: "참고", item: "남은 경기 수 M′", rule: "판정 아님", count: Mrest, detail: "하루 " + rows.length + "경기 중 남은 " + Mrest + "경기", info: true });
+    var total = items.reduce(function (s, x) { return s + x.count; }, 0);
+    return { items: items, extra: extra, total: total, rest: true,
+      info: { S: fr.S, loads: all.info.loads, empty: all.info.empty, totalDoubles: all.info.totalDoubles, restDoubles: totalR,
+        doubles: all.info.doubles, restDbl: rd, games: all.info.games, restGames: restGames, ppl: ppl, lambda: sh.lam, rho: sh.rho, per: per } };
+  }
+
+  global.Checker = { check: check, checkRest: checkRest, restShares: restShares };
 })(this);

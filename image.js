@@ -13,6 +13,7 @@
   var COLOR = {
     bg: "#ffffff", text: "#1f2328", muted: "#5f6b7a", line: "#a6a6a6", head: "#dde4ee",
     empty: "#f2f2f2", emptyText: "#808080",
+    done: "#d9d9d9", doneVeil: "rgba(160, 160, 160, 0.45)",   // 재편성 결과의 진행된 시간대 (개정 10)
     type: { "남복": "#dce9f7", "여복": "#fbe3ea", "혼복": "#e6f2df" }   // 화면 style.css·Excel과 같은 색
   };
 
@@ -32,7 +33,7 @@
   }
 
   function fileName(R) {
-    return "대진표_" + R.settings.date.replace(/-/g, "") + "_" + R.seed + ".png";
+    return "대진표_" + R.settings.date.replace(/-/g, "") + "_" + R.seed + (R.rest ? "_재편성" + R.rest.n : "") + ".png";
   }
 
   function font(px, bold) { return (bold ? "bold " : "") + px + "px " + FONT; }
@@ -73,7 +74,8 @@
 
     // 머리글 3줄: 제목 / 날짜·대진 번호·앱 버전 / 화면 요약 줄 (W5b)
     var center = sz.width / 2, inner = sz.width - L.pad * 2;
-    var line2 = dateLabel(s.date) + " · 대진 번호 " + R.seed + " · 앱 버전 " + R.version;
+    var line2 = dateLabel(s.date) + " · 대진 번호 " + R.seed + " · 앱 버전 " + R.version +
+      (R.rest ? " · 재편성 " + R.rest.n + "회 · " + Scheduler.slotTime(s.start, s.minutes, R.rest.T) + " 기준" : "");   // 8.1 (개정 10)
     var line3 = summary || (R.roster.length + "명 · " + courts + "면 · " + R.rows.length + "경기");
     ctx.fillStyle = COLOR.text;
     fitText(ctx, "배드민턴 대진표", center, L.pad + 26, inner, 36, 24, true, null);
@@ -96,13 +98,15 @@
     R.rows.forEach(function (r) { bySlot[r.slot + ":" + r.court] = r; });
     var y = top + L.headRowH;
     for (var slot = 0; slot < nSlots; slot++) {
-      ctx.fillStyle = COLOR.head;
+      var done = R.rest && slot <= R.rest.T;   // 진행된 시간대: 회색 + "진행됨" (Q2)
+      ctx.fillStyle = done ? COLOR.done : COLOR.head;
       ctx.fillRect(x0, y, L.timeW, L.rowH);
-      ctx.fillStyle = COLOR.text;
+      ctx.fillStyle = done ? COLOR.emptyText : COLOR.text;
       ctx.font = font(24, true);
-      ctx.fillText(Scheduler.slotTime(s.start, s.minutes, slot), x0 + L.timeW / 2, y + L.rowH / 2 - 16);
+      ctx.fillText(Scheduler.slotTime(s.start, s.minutes, slot), x0 + L.timeW / 2, y + L.rowH / 2 - (done ? 28 : 16));
       ctx.font = font(22, false);
-      ctx.fillText("~" + Scheduler.slotTime(s.start, s.minutes, slot + 1), x0 + L.timeW / 2, y + L.rowH / 2 + 16);
+      ctx.fillText("~" + Scheduler.slotTime(s.start, s.minutes, slot + 1), x0 + L.timeW / 2, y + L.rowH / 2 + (done ? 2 : 16));
+      if (done) { ctx.font = font(22, true); ctx.fillText("진행됨", x0 + L.timeW / 2, y + L.rowH / 2 + 34); }
       if (!R.loads[slot]) {
         // D3: 경기가 하나도 없는 시간대는 줄 전체에 한 문구 (칸 선은 아래에서 이 줄만 건너뜀)
         ctx.fillStyle = COLOR.empty;
@@ -128,6 +132,7 @@
           // show1·show2: 화면과 같은 표시 순서 (8.1, 혼복은 남자 먼저)
           fitText(ctx, m.show1.join(" · "), mid, y + 57, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
           fitText(ctx, m.show2.join(" · "), mid, y + 120, L.cellW - 16, L.nameFont, L.nameFontMin, true, stats);
+          if (done) { ctx.fillStyle = COLOR.doneVeil; ctx.fillRect(cx, y, L.cellW, L.rowH); }   // 진행된 경기는 흐리게
         } else {
           ctx.fillStyle = COLOR.empty;
           ctx.fillRect(cx, y, L.cellW, L.rowH);

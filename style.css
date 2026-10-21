@@ -148,6 +148,23 @@ progress { width: 100%; height: 14px; }
 
 .foot { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 16px; }
 
+/* 진행 중 재편성 (개정 10, 8.1) */
+.rest-title { margin: 0 0 4px; font-size: 1.15rem; }
+.rest-label { font-weight: bold; margin: 0 0 6px; display: block; }
+#rest-T { min-width: 16em; }
+table.rest td { text-align: left; }
+table.rest td input { min-width: 80px; }
+table.rest tr.changed td, table.rest-people tr.changed td { background: #fff8e8; }
+table.rest-people { width: auto; }
+.row.tight { margin: 0; gap: 4px; }
+table.grid tr.fixed th, table.grid tr.fixed td { background: #d9d9d9 !important; color: #6b6b6b; }
+table.grid.mini td.left { text-align: left; font-size: 0.85rem; }
+#mine-list tr.fixed td { background: #ececec; color: #6b6b6b; }
+.done-tag { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 4px; background: #bdbdbd; color: #fff; font-size: 0.8rem; font-weight: bold; }
+.actions.sticky { position: sticky; bottom: 0; background: var(--card); padding: 10px 0; border-top: 1px solid var(--line); z-index: 2; }
+.rest-grid-wrap { margin-top: 8px; }
+details summary { cursor: pointer; color: var(--primary); margin: 6px 0; }
+
 @media (max-width: 600px) {
   .top h1 { font-size: 1.1rem; }
   .actions { flex-wrap: wrap; }

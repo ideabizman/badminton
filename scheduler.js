@@ -12,7 +12,10 @@
 
   // 이 파일의 생성 결과가 바뀌면 올린다 (CLAUDE.md 7절)
   // 2.0.0 (CLAUDE.md 개정 8): 종료 시각·코트 수 입력, 참여 시간 비례 몫, 2연속 허용(3연속 금지), 빈 코트는 뒤로
-  var SCHEDULER_VERSION = "2.0.0";
+  // 2.1.0 (CLAUDE.md 개정 10, _work\plan_w7.md): 진행 중 재편성(6.8)만 더함. 재편성이 없는 대진은 2.0.0과 같다
+  //   (2.0.0 함수는 그대로 두고, 재편성은 이 파일 끝의 rest* 함수가 따로 한다)
+  var SCHEDULER_VERSION = "2.1.0";
+  var SAME_RULE_VERSIONS = ["2.0.0", "2.1.0"];   // 재편성 없는 대진의 생성 규칙이 같은 버전 (plan_w7 2.7, Q5)
 
   var GRADE_SCORE = { A: 4, B: 3, C: 2, D: 1, "초심": 0 };   // 6.1
   var MAX_GRADE_DIFF = 1;
@@ -607,6 +610,462 @@
     return { step: step, result: result };
   }
 
+  // ════════════════════════════════════════════════════════════
+  // 진행 중 재편성 (CLAUDE.md 6.8, plan_w7.md 2.4–2.6). 위의 2.0.0 함수는 바꾸지 않고 여기서 따로 한다.
+  // ════════════════════════════════════════════════════════════
+
+  /*
+   * 6.8.2 변동을 바탕 명단에 적용한다.
+   * base: {roster: [{name, gender, grade, arrival, leave}], rows: [{slot, court, type, t1: [이름, 이름], t2: [이름, 이름]}]}
+   * changes: [{kind: "absent"|"arrival"|"leave"|"new", name, arrival, leave, gender, grade}]
+   * 돌려주는 값: {roster(정렬), changeOf: {이름: 변동}, errors: [글], played0: {이름: 고정 경기 수}}
+   */
+  function restRoster(base, settings, T, changes) {
+    var sl = slots(settings), d = sl.minutes;
+    var tNext = fmtHM(sl.start + (T + 1) * d);          // t_(T+1) = 지금 경기가 끝나는 시각
+    var played0 = {};
+    base.roster.forEach(function (p) { played0[p.name] = 0; });
+    base.rows.forEach(function (r) { if (r.slot <= T) r.t1.concat(r.t2).forEach(function (x) { played0[x] = (played0[x] || 0) + 1; }); });
+    var byName = {}, errors = [], changeOf = {};
+    base.roster.forEach(function (p) { byName[p.name] = { name: p.name, gender: p.gender, grade: p.grade, arrival: p.arrival || "", leave: p.leave || "" }; });
+    var startOf = function (v) { var x = parseHM(v); return x === null ? null : x; };
+    (changes || []).forEach(function (c) {
+      var p = byName[c.name];
+      if (c.kind === "new") {
+        if (!c.name || p) { errors.push((c.name || "(이름 없음)") + ": 새로 온 사람의 이름이 비었거나 명단에 이미 있습니다"); return; }
+        if (["남", "여"].indexOf(c.gender) < 0 || !(c.grade in GRADE_SCORE)) { errors.push(c.name + ": 성별·급수를 골라 주세요"); return; }
+        var a = c.arrival || tNext;
+        if (startOf(a) === null || startOf(a) < startOf(tNext)) { errors.push(c.name + ": 새로 온 사람의 참가 시각은 " + tNext + " 이후여야 합니다"); return; }
+        byName[c.name] = { name: c.name, gender: c.gender, grade: c.grade, arrival: a, leave: c.leave || "" };
+        changeOf[c.name] = "new";
+        return;
+      }
+      if (!p) { errors.push(c.name + ": 명단에 없는 사람입니다"); return; }
+      if (c.kind === "absent") {
+        if (played0[c.name] > 0) { p.leave = tNext; changeOf[c.name] = "absent-played"; }   // T 끝에 일찍 감으로 처리
+        else { delete byName[c.name]; changeOf[c.name] = "absent"; }
+      } else if (c.kind === "arrival") {
+        if (played0[c.name] > 0) { errors.push(c.name + ": 지난 경기가 있는 사람은 참가 시각을 바꿀 수 없습니다"); return; }
+        if (startOf(c.arrival) === null || startOf(c.arrival) < startOf(tNext)) { errors.push(c.name + ": 참가 시각은 " + tNext + " 이후로 골라 주세요"); return; }
+        p.arrival = c.arrival; changeOf[c.name] = "arrival";
+      } else if (c.kind === "leave") {
+        if (startOf(c.leave) === null || startOf(c.leave) < startOf(tNext)) { errors.push(c.name + ": 퇴장 시각은 " + tNext + " 이후로 골라 주세요"); return; }
+        p.leave = c.leave; changeOf[c.name] = "leave";
+      }
+    });
+    var roster = sortRoster(Object.keys(byName).map(function (k) { return byName[k]; }));
+    return { roster: roster, changeOf: changeOf, errors: errors, played0: played0 };
+  }
+
+  /*
+   * 바뀐 명단에서 사람마다 g0(고정 경기 수), run(T에서 끝나는 연속 출전 수), m′, H′ (plan 2.4).
+   * fixed: 바탕의 0…T 경기를 새 명단 번호로 옮긴 것 [{slot, court, type, t1: [번호], t2: [번호]}]
+   */
+  function restPeople(iv, fixed, T, maxGames) {
+    var n = iv.people.length;
+    var on = [];
+    for (var t = 0; t <= T; t++) on.push(new Array(n).fill(false));
+    fixed.forEach(function (m) { m.t1.concat(m.t2).forEach(function (x) { on[m.slot][x] = true; }); });
+    return iv.people.map(function (p, i) {
+      var g0 = 0, run = 0;
+      for (t = 0; t <= T; t++) { if (on[t][i]) { g0++; run++; } else run = 0; }
+      var fr = Math.max(p.f, T + 1);
+      var mr = Math.max(0, p.l - fr + 1);
+      var H = maxPlays(mr, fr === T + 1 ? run : 0);
+      if (maxGames) H = Math.min(H, maxGames - g0);
+      return { index: i, f: p.f, l: p.l, m: p.m, g0: g0, run: fr === T + 1 ? run : 0, runAtT: run, mRest: mr, H: Math.max(0, H) };
+    });
+  }
+
+  /*
+   * 6.8.3 M′ 상한 (plan 2.4): 2.0.0 동적 계획에 고정 시간대 경기 수를 묶어서 계산한다(3칸 창 ②가 저절로 들어감).
+   * T+1 시간대는 T−1·T에 모두 뛴 사람을 빼고 상한을 다시 잡는다(①), ⌊ΣH′/4⌋(③)
+   */
+  function restBound(iv, rp, courts, fixedLoads, T) {
+    var S = iv.S;
+    var caps = loadCaps(iv, courts);
+    var slotCap = caps.slotCap.slice();
+    for (var t = 0; t <= T; t++) slotCap[t] = fixedLoads[t];
+    var note = null;
+    if (T + 1 < S) {
+      var present = iv.A[T + 1];
+      var rested = rp.filter(function (p) { return p.runAtT >= 2 && p.f <= T + 1 && T + 1 <= p.l; }).length;
+      slotCap[T + 1] = Math.min(courts, Math.floor((present - rested) / 4));
+      var before = Math.min(courts, Math.floor(present / 4));
+      if (slotCap[T + 1] < before) note = { slot: T + 1, games: slotCap[T + 1], rested: rested };   // 미리보기·결과 설명 (Q7)
+    }
+    var c2 = { slotCap: slotCap, win: caps.win, courts: courts };
+    var tbl = S > 0 ? suffixTable(c2, S, fixedLoads) : null;
+    var fixedSum = fixedLoads.reduce(function (s, v) { return s + v; }, 0);
+    var total = tbl ? tbl[0][0][0] : -Infinity;
+    var byWindow = total === -Infinity ? 0 : Math.max(0, total - fixedSum);
+    var bySlot = 0;
+    for (t = T + 1; t < S; t++) bySlot += slotCap[t];
+    var byH = Math.floor(rp.reduce(function (s, p) { return s + p.H; }, 0) / 4);
+    return { M: Math.min(byWindow, byH), bySlot: bySlot, byWindow: byWindow, byH: byH, full: courts * (S - T - 1),
+      caps: c2, table: tbl, fixedSum: fixedSum, byWindowTotal: fixedSum + byWindow, note: note };
+  }
+
+  // 남은 시간대의 사전순 최대 부하 목록 (하루 전체 길이, 고정 시간대는 바탕 값)
+  function restLoads(rb, S, Mrest, fixedLoads) {
+    return lexLoads({ caps: rb.caps, table: rb.table, byWindow: rb.byWindowTotal }, S, rb.fixedSum + Mrest, fixedLoads);
+  }
+
+  // 분수 비교 도우미 (분자/분모, 분모 > 0)
+  function fracCmp(a, b) { return a.n * b.d - b.n * a.d; }
+
+  /*
+   * 6.8.4 남은 몫 (plan 2.5): ρₚ = clamp(λmₚ − g0ₚ, 0, H′ₚ), Σρ = 4M′. λ는 꺾이는 점 따라가기로 정확한 분수.
+   * 정수 배정은 2.0.0 quotas와 같은 순서(⌊ρ⌋ → 소수점 큰 순, 같으면 대진 번호 난수 → 성별 짝수 1쌍 바꿈).
+   * 고정이 없으면(g0 = 0, H′ = H) 2.0.0 quotas와 같은 결과 (회귀 확인용으로 그 경우에도 부를 수 있게 둠)
+   * rp: [{m, g0, H}], gd: 성별 배열
+   */
+  function restQuotas(rp, gd, M, seed, draw) {
+    var n = rp.length, target4 = 4 * M, i;
+    var act = [];
+    for (i = 0; i < n; i++) if (rp[i].H > 0 && rp[i].m > 0) act.push(i);
+    var capSum = act.reduce(function (s, k) { return s + rp[k].H; }, 0);
+    if (target4 > capSum) return { ok: false, reason: "cap" };
+    // F(λ) at λ = p/q → 분자 (분모 q)
+    function Fnum(l) {
+      var s = 0;
+      act.forEach(function (k) { var v = l.n * rp[k].m - rp[k].g0 * l.d; s += Math.max(0, Math.min(v, rp[k].H * l.d)); });
+      return s;
+    }
+    var pts = [{ n: 0, d: 1 }];
+    act.forEach(function (k) { pts.push({ n: rp[k].g0, d: rp[k].m }); pts.push({ n: rp[k].g0 + rp[k].H, d: rp[k].m }); });
+    pts.sort(fracCmp);
+    var lam = null, prev = null;
+    for (i = 0; i < pts.length; i++) {
+      var pt = pts[i];
+      var fv = Fnum(pt);                                   // F(pt) × pt.d
+      if (fv >= target4 * pt.d) {
+        if (fv === target4 * pt.d || prev === null) { lam = pt; break; }
+        // prev와 pt 사이: 가운데 묶음 B (aₚ ≤ prev, bₚ ≥ pt) 로 정확히 푼다
+        var hiSum = 0, gB = 0, mB = 0;
+        act.forEach(function (k) {
+          var a = { n: rp[k].g0, d: rp[k].m }, b = { n: rp[k].g0 + rp[k].H, d: rp[k].m };
+          if (fracCmp(b, prev) <= 0) hiSum += rp[k].H;
+          else if (fracCmp(a, prev) <= 0 && fracCmp(b, pt) >= 0) { gB += rp[k].g0; mB += rp[k].m; }
+        });
+        lam = { n: target4 - hiSum + gB, d: mB };
+        break;
+      }
+      prev = pt;
+    }
+    if (!lam || lam.d <= 0) return { ok: false, reason: "cap" };
+    var den = lam.d;
+    var num = new Array(n).fill(0);
+    act.forEach(function (k) { num[k] = Math.max(0, Math.min(lam.n * rp[k].m - rp[k].g0 * den, rp[k].H * den)); });
+    var rho = num.map(function (v) { return v / den; });
+    var target = num.map(function (v) { return Math.floor(v / den); });
+    var frac = num.map(function (v) { return v % den; });
+    var rest = target4 - target.reduce(function (s, v) { return s + v; }, 0);
+    // 아래는 2.0.0 quotas와 같은 순서·같은 난수 식 (회귀: 고정이 없으면 같은 배정)
+    var rng = makeRng((seed ^ QUOTA_SALT ^ Math.imul(M, 0x9E3779B1) ^ Math.imul(draw || 0, 0x27D4EB2F)) >>> 0);
+    var rank = shuffle(Array.from({ length: n }, function (_, k) { return k; }), rng);
+    var rk = new Array(n);
+    rank.forEach(function (p, r) { rk[p] = r; });
+    var cand = [];
+    for (var c = 0; c < n; c++) if (frac[c] > 0) cand.push(c);
+    cand.sort(function (a, b) { return (frac[b] - frac[a]) || (rk[a] - rk[b]); });
+    if (rest > cand.length) return { ok: false, reason: "cap" };
+    var got = new Array(n).fill(false);
+    cand.slice(0, rest).forEach(function (p) { got[p] = true; target[p] += 1; });
+    var men = 0;
+    for (c = 0; c < n; c++) if (gd[c] === "남") men += target[c];
+    var swapped = null;
+    if (men % 2 !== 0) {
+      var opts = [];
+      ["남", "여"].forEach(function (g) {
+        var giver = null, taker = null;
+        for (var k = cand.length - 1; k >= 0; k--) { var p = cand[k]; if (got[p] && gd[p] === g) { giver = p; break; } }
+        for (k = 0; k < cand.length; k++) { var w = cand[k]; if (!got[w] && gd[w] !== g) { taker = w; break; } }
+        if (giver !== null && taker !== null) opts.push({ giver: giver, taker: taker, loss: frac[giver] - frac[taker] });
+      });
+      if (!opts.length) return { ok: false, reason: "parity", q: rho, target: target, lambda: lam };
+      var minLoss = Math.min.apply(null, opts.map(function (o) { return o.loss; }));
+      opts = opts.filter(function (o) { return o.loss === minLoss; });
+      var pick = opts.length === 1 ? opts[0] : opts[Math.floor(rng() * opts.length)];
+      target[pick.giver] -= 1; target[pick.taker] += 1;
+      swapped = pick;
+    }
+    return { ok: true, q: rho, target: target, swapped: swapped, lambda: lam, num: num, den: den };
+  }
+
+  /*
+   * 재편성 계산(탐색 전). 미리보기와 탐색 시작점.
+   * base: {roster, rows}, T: 기준 시간대, changes: 6.8.2 변동
+   * 돌려주는 값: {ok, errors, reason, roster, changeOf, iv, fixed, fixedLoads, rp, rb, M, loads, quota, parityDrops}
+   */
+  function restPlan(base, settings, T, changes, seed) {
+    var out = { ok: false, errors: [], reason: null, M: 0, loads: null, quota: null, parityDrops: [] };
+    var S = slots(settings).S;
+    if (T < 0) { out.reason = "before"; return out; }
+    if (T >= S - 1) { out.reason = "last"; return out; }
+    var rr = restRoster(base, settings, T, changes);
+    out.roster = rr.roster; out.changeOf = rr.changeOf; out.errors = rr.errors;
+    if (rr.errors.length) { out.reason = "input"; return out; }
+    var idx = {};
+    rr.roster.forEach(function (p, i) { idx[p.name] = i; });
+    var fixed = [], fixedLoads = [];
+    for (var t = 0; t <= T; t++) fixedLoads.push(0);
+    base.rows.forEach(function (r) {
+      if (r.slot > T) return;
+      fixed.push({ slot: r.slot, court: r.court, type: r.type, t1: r.t1.map(function (x) { return idx[x]; }), t2: r.t2.map(function (x) { return idx[x]; }) });
+      fixedLoads[r.slot] += 1;
+    });
+    var iv = intervals(rr.roster, settings);
+    out.iv = iv; out.fixed = fixed; out.fixedLoads = fixedLoads;
+    if (iv.bad.length && iv.bad.some(function (p) { return !(rr.changeOf[rr.roster[p.index].name] === "absent-played"); })) {
+      out.errors = iv.bad.map(function (p) { return rr.roster[p.index].name + ": 경기할 시간대가 없습니다"; });
+      out.reason = "input"; return out;
+    }
+    var rp = restPeople(iv, fixed, T, settings.maxGames);
+    out.rp = rp;
+    var rb = restBound(iv, rp, settings.courts, fixedLoads, T);
+    out.rb = rb;
+    var gd = rr.roster.map(function (p) { return p.gender; });
+    var M = rb.M;
+    while (M > 0) {
+      var qt = restQuotas(rp, gd, M, seed);
+      if (qt.ok) {
+        out.M = M; out.quota = qt; out.loads = restLoads(rb, S, M, fixedLoads); out.ok = true;
+        return out;
+      }
+      out.parityDrops.push(M);
+      M -= 1;
+    }
+    out.reason = out.parityDrops.length ? "parity" : "empty";
+    return out;
+  }
+
+  /*
+   * 재편성 한 번 시도 (2.0.0 tryBuild를 바탕으로 따로 둔 것, plan 1.3·2.6).
+   * 고정 경기로 파트너 기록·직전 연속·하루 2연속을 채우고 T+1부터 만든다. 목표는 남은 배정 rₚ.
+   * 2연속은 "남은 2연속"(T·T+1 쌍부터)을 따로 세어 ⓗ′(rₚ ≥ 1인 사람끼리 차이 ≤ 1, Q9)로 판정한다.
+   */
+  function tryBuildRest(ctx, target, loads, flexible, rng) {
+    var n = ctx.n, S = ctx.S, f = ctx.f, l = ctx.l, sc = ctx.sc, gd = ctx.gd, T = ctx.T;
+    var remaining = target.slice();
+    var run = new Array(n).fill(0);
+    var doubles = new Array(n).fill(0);      // 하루 전체 (참고)
+    var restDbl = new Array(n).fill(0);      // 남은 2연속 (ⓗ′)
+    var partners = new Set();
+    var schedule = [];
+    var actual = [];
+    var t, p, u;
+    for (t = 0; t <= T; t++) {
+      var fm = ctx.fixed.filter(function (m) { return m.slot === t; });
+      var on = {};
+      fm.forEach(function (m) {
+        schedule.push(m);
+        partners.add(pairKey(m.t1[0], m.t1[1])); partners.add(pairKey(m.t2[0], m.t2[1]));
+        m.t1.concat(m.t2).forEach(function (x) { on[x] = true; });
+      });
+      for (p = 0; p < n; p++) {
+        if (on[p]) { if (run[p] >= 1) doubles[p] += 1; run[p] += 1; } else run[p] = 0;
+      }
+      actual.push(fm.length);
+    }
+    var spareAfter = [];
+    for (t = 0; t < S; t++) {
+      var sp = 0;
+      for (u = Math.max(t + 1, T + 1); u < S; u++) sp += ctx.slotCap[u] - loads[u];
+      spareAfter.push(sp);
+    }
+    var carry = 0;
+
+    for (t = T + 1; t < S; t++) {
+      var urgent = new Set(), eligible = [];
+      for (p = 0; p < n; p++) {
+        if (remaining[p] <= 0) continue;
+        if (t > l[p]) return null;
+        if (f[p] > t) { if (remaining[p] > maxPlays(l[p] - f[p] + 1, 0)) return null; continue; }
+        if (remaining[p] > maxPlays(l[p] - t + 1, run[p])) return null;
+        if (remaining[p] > maxPlays(l[p] - t, 0)) urgent.add(p);
+        if (run[p] < 2) eligible.push(p);
+      }
+      var want, kmin;
+      if (flexible) {
+        want = Math.min(ctx.slotCap[t], loads[t] + carry, Math.floor(eligible.length / 4));
+        kmin = Math.ceil(urgent.size / 4);
+      } else {
+        want = kmin = loads[t];
+        if (urgent.size > 4 * want || eligible.length < 4 * want) return null;
+      }
+      if (kmin > want) return null;
+
+      var rested = eligible.filter(function (x) { return run[x] === 0 || urgent.has(x); });
+      var slotMatches = null;
+      for (var k = want; k >= kmin && !slotMatches; k--) {
+        if (k === 0) { slotMatches = []; break; }
+        var restedFirst = rested.length >= 4 * k && rested.length < eligible.length ? RESTED_ATTEMPTS : 0;
+        for (var attempt = 0; attempt < restedFirst + SLOT_ATTEMPTS; attempt++) {
+          var keyed = (attempt < restedFirst ? rested : eligible).map(function (x, idx) {
+            return { p: x, u: urgent.has(x) ? 0 : 1, r: run[x] === 0 ? 0 : 1 + restDbl[x],
+              v: Math.ceil((l[x] - t) / 2) - remaining[x] + rng() * 0.99, idx: idx };
+          });
+          keyed.sort(function (A, B) { return (A.u - B.u) || (A.r - B.r) || (A.v - B.v) || (A.idx - B.idx); });
+          var order = keyed.map(function (o) { return o.p; });
+          var used = new Set();
+          var ms = [];
+          for (var mi = 0; mi < k; mi++) {
+            var pool = order.filter(function (x) { return !used.has(x); });
+            if (!pool.length) break;
+            var m = findMatch(pool[0], pool.slice(1), sc, gd, partners, rng);
+            if (!m) break;
+            ms.push(m);
+            m.t1.concat(m.t2).forEach(function (x) { used.add(x); });
+          }
+          var allUrgent = true;
+          urgent.forEach(function (x) { if (!used.has(x)) allUrgent = false; });
+          if (ms.length === k && allUrgent) { slotMatches = ms; break; }
+        }
+      }
+      if (!slotMatches) return null;
+      if (flexible) {
+        carry = loads[t] + carry - slotMatches.length;
+        if (carry > spareAfter[t]) return null;
+      }
+
+      var playing = {};
+      slotMatches.forEach(function (m, ci) {
+        schedule.push({ slot: t, court: ci + 1, t1: m.t1, t2: m.t2, type: m.type });
+        partners.add(pairKey(m.t1[0], m.t1[1]));
+        partners.add(pairKey(m.t2[0], m.t2[1]));
+        m.t1.concat(m.t2).forEach(function (x) { playing[x] = true; });
+      });
+      for (p = 0; p < n; p++) {
+        if (playing[p]) { remaining[p] -= 1; if (run[p] >= 1) { doubles[p] += 1; restDbl[p] += 1; } run[p] += 1; } else run[p] = 0;
+      }
+      actual.push(slotMatches.length);
+    }
+    for (p = 0; p < n; p++) if (remaining[p]) return null;
+    // ⓗ′: 남은 배정이 1 이상인 사람끼리 남은 2연속 차이 ≤ 1 (Q9)
+    var vals = [];
+    for (p = 0; p < n; p++) if (target[p] >= 1) vals.push(restDbl[p]);
+    if (vals.length && Math.max.apply(null, vals) - Math.min.apply(null, vals) > 1) return null;
+    return { schedule: schedule, loads: actual, doubles: doubles, restDoubles: restDbl };
+  }
+
+  /*
+   * 재편성 탐색 (plan 2.6). 시도 한도·M′ 줄이기·동점 다시 뽑기는 2.0.0 createSearch와 같은 값.
+   * base: {roster, rows(이름)}, settings, T, changes, seed(새 대진 번호)
+   */
+  function createRestSearch(base, settings, T, changes, seed) {
+    var pl = restPlan(base, settings, T, changes, seed);
+    var reductions = pl.parityDrops.map(function (M) { return { from: M, to: M - 1, reason: "parity" }; });
+    var state = { M: pl.M, quota: pl.quota, loads: pl.loads, levelTries: 0, totalTries: 0, drops: 0, draw: 0,
+      found: 0, best: null, done: !pl.ok, failReason: pl.ok ? null : pl.reason, tried: pl.ok ? [pl.M] : [] };
+    var ctx = null, gd = null;
+    if (pl.ok) {
+      var iv = pl.iv;
+      gd = pl.roster.map(function (p) { return p.gender; });
+      ctx = { n: pl.roster.length, S: iv.S, T: T,
+        f: iv.people.map(function (p) { return p.f; }), l: iv.people.map(function (p) { return p.l; }),
+        sc: pl.roster.map(function (p) { return GRADE_SCORE[p.grade]; }), gd: gd,
+        slotCap: pl.rb.caps.slotCap, fixed: pl.fixed };
+    }
+    var rng = makeRng(seed);
+
+    function nextLevel() {
+      state.drops += 1;
+      if (state.drops > MAX_SEARCH_DROPS || state.totalTries >= MAX_TOTAL_TRIES) { state.done = true; state.failReason = "search"; return; }
+      var M = state.M - 1;
+      reductions.push({ from: state.M, to: M, reason: "search" });
+      while (M > 0) {
+        if (restQuotas(pl.rp, gd, M, seed).ok) break;
+        reductions.push({ from: M, to: M - 1, reason: "parity" });
+        M -= 1;
+      }
+      if (M <= 0) { state.done = true; state.failReason = "search"; return; }
+      state.M = M;
+      state.quota = restQuotas(pl.rp, gd, M, seed);
+      state.loads = restLoads(pl.rb, ctx.S, M, pl.fixedLoads);
+      state.levelTries = 0;
+      state.draw = 0;
+      state.tried.push(M);
+    }
+
+    function step(budgetMs) {
+      var until = Date.now() + budgetMs;
+      while (!state.done && Date.now() < until) {
+        if (!state.found && state.levelTries > 0 && state.levelTries % QUOTA_REDRAW === 0) {
+          state.draw += 1;
+          var qd = restQuotas(pl.rp, gd, state.M, seed, state.draw);
+          if (qd.ok) state.quota = qd;
+        }
+        state.levelTries += 1;
+        state.totalTries += 1;
+        var flexible = state.levelTries > STRICT_TRIES;
+        var s = tryBuildRest(ctx, state.quota.target, state.loads, flexible, rng);
+        if (s) {
+          state.found += 1;
+          var cand = {
+            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles, restDoubles: s.restDoubles,
+            totalDoubles: s.restDoubles.reduce(function (a, b) { return a + b; }, 0),
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota
+          };
+          if (state.best === null || better(cand, state.best)) state.best = cand;
+          if (state.found >= SOLUTIONS_TO_COMPARE) { state.done = true; break; }
+        }
+        if (state.levelTries >= TRIES_PER_M) {
+          if (state.found > 0) state.done = true;
+          else nextLevel();
+        } else if (state.totalTries >= MAX_TOTAL_TRIES) {
+          state.done = true;
+          if (!state.found) state.failReason = "search";
+        }
+      }
+      return { done: state.done, tries: state.totalTries, found: state.found, maxTries: MAX_TOTAL_TRIES, M: state.M };
+    }
+
+    function result() {
+      var b = state.best;
+      var qt = b ? b.quota : pl.quota;
+      var fixedPairs = [];
+      (pl.fixed || []).forEach(function (m) { fixedPairs.push(pairKey(m.t1[0], m.t1[1])); fixedPairs.push(pairKey(m.t2[0], m.t2[1])); });
+      return {
+        ok: b !== null,
+        rest: true,
+        T: T,
+        errors: pl.errors,
+        roster: pl.roster || [],
+        changeOf: pl.changeOf || {},
+        matches: b ? b.matches : [],
+        M: b ? b.M : 0,                                 // M′ (남은 경기 수)
+        dayM: b ? b.matches.length : 0,
+        loads: b ? b.loads : [],
+        doubles: b ? b.doubles : [],
+        restDoubles: b ? b.restDoubles : [],
+        totalDoubles: b ? b.totalDoubles : 0,           // 남은 2연속 총 횟수
+        dayDoubles: b ? b.doubles.reduce(function (a, c) { return a + c; }, 0) : 0,
+        repeatOpp: b ? b.repeatOpp : null,
+        q: qt ? qt.q : [],
+        target: qt ? qt.target : [],
+        lambda: qt ? qt.lambda : null,
+        rp: pl.rp || [],
+        plannedLoads: state.loads,
+        upper: pl.rb ? pl.rb.M : 0,
+        ub: pl.rb ? { full: pl.rb.full, bySlot: pl.rb.bySlot, byWindow: pl.rb.byWindow, byH: pl.rb.byH } : null,
+        note: pl.rb ? pl.rb.note : null,
+        fixedPairs: fixedPairs,
+        reductions: reductions,
+        tried: state.tried,
+        failReason: b ? null : state.failReason,
+        found: state.found,
+        tries: state.totalTries,
+        iv: pl.iv || null,
+        S: slots(settings).S,
+        seed: seed,
+        version: SCHEDULER_VERSION
+      };
+    }
+
+    return { step: step, result: result, plan: pl };
+  }
+
   global.Scheduler = {
     SCHEDULER_VERSION: SCHEDULER_VERSION,
     GRADE_SCORE: GRADE_SCORE,
@@ -628,6 +1087,14 @@
     quotas: quotas,
     needsDoubles: needsDoubles,
     plan: plan,
-    createSearch: createSearch
+    createSearch: createSearch,
+    // 2.1.0 재편성
+    SAME_RULE_VERSIONS: SAME_RULE_VERSIONS,
+    restRoster: restRoster,
+    restPeople: restPeople,
+    restBound: restBound,
+    restQuotas: restQuotas,
+    restPlan: restPlan,
+    createRestSearch: createRestSearch
   };
 })(this);

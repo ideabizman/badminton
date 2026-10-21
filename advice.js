@@ -77,5 +77,73 @@
     };
   }
 
-  global.Advice = { SMALL_GROUP_MAX: SMALL_GROUP_MAX, forFailure: forFailure };
+  /*
+   * 재편성 실패 안내 (plan_w7.md 2.8, 검토 반영 Q7): R0 → P → N → A. 바탕 대진은 그대로 둔다.
+   * res: Scheduler.createRestSearch 결과(ok가 false), settings: 설정
+   * N: 새로 온 사람 x(남은 배정 ≥ 1)마다, x와 같은 경기에 들어갈 수 있는 4인 조합(종류·급수 차이 ≤ 1·하루 파트너 기록과 안 겹침)이
+   *    남은 배정보다 적으면 N
+   */
+  function newcomerShort(res) {
+    var roster = res.roster, iv = res.iv, T = res.T, out = [];
+    if (!iv) return out;
+    var sc = { A: 4, B: 3, C: 2, D: 1, "초심": 0 };
+    var used = {};
+    (res.fixedPairs || []).forEach(function (k) { used[k] = true; });
+    function pk(a, b) { return a < b ? a + "," + b : b + "," + a; }
+    roster.forEach(function (x, xi) {
+      if (res.changeOf[x.name] !== "new" || !(res.target[xi] >= 1)) return;
+      var px = iv.people[xi];
+      var near = [];
+      roster.forEach(function (y, yi) {
+        if (yi === xi || !(res.rp[yi] && res.rp[yi].H > 0)) return;
+        var py = iv.people[yi];
+        if (Math.min(px.l, py.l) >= Math.max(px.f, py.f, T + 1)) near.push(yi);
+      });
+      var count = 0;
+      near.forEach(function (q) {
+        if (used[pk(xi, q)]) return;
+        var gx = [x.gender, roster[q].gender].sort().join("");
+        var s1 = sc[x.grade] + sc[roster[q].grade];
+        for (var i = 0; i < near.length; i++) for (var j = i + 1; j < near.length; j++) {
+          var a = near[i], b = near[j];
+          if (a === q || b === q || used[pk(a, b)]) continue;
+          if ([roster[a].gender, roster[b].gender].sort().join("") !== gx) continue;
+          if (Math.abs(s1 - sc[roster[a].grade] - sc[roster[b].grade]) > 1) continue;
+          count++;
+        }
+      });
+      if (count < res.target[xi]) out.push(x.name);
+    });
+    return out;
+  }
+
+  function forRestFailure(res, settings) {
+    var items = [];
+    var tried = res.tried && res.tried.length
+      ? (res.tried.length > 1 ? res.tried[0] + " → " + res.tried[res.tried.length - 1] + "경기까지" : res.tried[0] + "경기로")
+      : "";
+    var intro;
+    if (res.failReason === "empty") {
+      intro = { kind: "R0", text: "남은 시간에 경기를 할 수 있는 사람이 4명이 안 됩니다." };
+    } else if (res.failReason === "parity") {
+      intro = { kind: "P", text: "남은 경기에서 남자 또는 여자의 출전 횟수 합을 짝수로 맞출 수 없습니다. 한 경기에 남자·여자는 0·2·4명씩 들어가기 때문입니다." };
+      items.push({ kind: "P", text: "새로 온 사람이나 불참한 사람의 남녀 구성을 확인해 보세요." });
+    } else {
+      intro = { kind: "T", text: res.tries + "번 시도했지만(" + tried + " 줄여 가며) 지난 경기를 그대로 두고 모든 규칙을 함께 지키는 남은 대진을 찾지 못했습니다." };
+    }
+    if (res.failReason === "search") {
+      var short = newcomerShort(res);
+      if (short.length) items.push({ kind: "N", text: "새로 온 " + short.join(", ") + " 님과 급수·성별이 맞는 상대가 적습니다." });
+      items.push({ kind: "A", text: "대진 번호가 바뀌면 짤 수 있을 수 있습니다. [새 번호로 다시 짜기]를 눌러 보세요." });
+    }
+    return {
+      title: "남은 시간의 대진을 규칙대로 짜지 못했습니다. 지금 대진은 그대로입니다.",
+      intro: intro,
+      items: items,
+      offerNewSeed: res.failReason === "search",
+      kinds: [intro.kind].concat(items.map(function (it) { return it.kind; }))
+    };
+  }
+
+  global.Advice = { SMALL_GROUP_MAX: SMALL_GROUP_MAX, forFailure: forFailure, forRestFailure: forRestFailure, newcomerShort: newcomerShort };
 })(this);

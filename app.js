@@ -2,11 +2,15 @@
  * app.js — 화면 동작. 대진 생성 규칙은 scheduler.js, 자기 점검은 checker.js, 실패 안내는 advice.js에 있다.
  * 명단은 이 브라우저 안에서만 다루고, 외부로 보내지 않는다.
  * 개정 8 (W5b): ① 설정 → ② 명단 → ③ 결과. 1인당 경기 수는 입력하지 않고 참여 시간에 비례해 계산한다.
+ * 개정 10 (W7): ③ 결과의 [진행 중 변경] → 진행 중 재편성 화면(8.1). 오늘 대진은 이 기기에만 저장한다(plan_w7.md 2.2).
  */
 (function () {
   "use strict";
 
   var STORAGE_KEY = "w_badminton_last_roster";   // 명단 + 설정(plan 2.7)을 함께 저장
+  var TODAY_KEY = "w_badminton_today";            // 재편성용 오늘 대진 (plan_w7.md 2.2, 이 기기 안에만)
+  var TODAY_FORMAT = 1;
+  var CHANGE_LABEL = { same: "그대로", absent: "불참", arrival: "참가 시각 변경", leave: "일찍 감", "new": "새로 옴" };
   var GENDERS = ["남", "여"];
   var GRADES = ["A", "B", "C", "D", "초심"];
   var COLUMN_ALIASES = { name: ["이름", "성명"], gender: ["성별"], grade: ["급수", "출전급수"] };
@@ -20,7 +24,7 @@
   var STEP_BUDGET_MS = 40;     // 한 번에 계산하는 시간. 그 사이에 화면을 다시 그린다
   // 화면 수정일 (12절: 다시 올린 뒤 새 화면이 보이는지 확인용). 생성 결과와 관계없으므로 SCHEDULER_VERSION과 따로 둔다.
   // 바꿀 때 index.html의 ?v= 날짜도 함께 바꾼다
-  var UI_BUILD = "2026-10-20";
+  var UI_BUILD = "2026-10-21";
   var STALE_MSG = "명단·설정이 바뀌었습니다. [다시 만들기]를 눌러야 반영됩니다";
   // 카톡 안 브라우저 (4.3). 브라우저 정보는 이 기기 안에서 읽기만 한다
   var IN_KAKAO = /KAKAOTALK/i.test(navigator.userAgent || "");
@@ -32,7 +36,9 @@
     fileSettings: null,     // 불러온 Excel의 '대진표 생성 기준' 값 (이 앱이 저장한 파일일 때)
     fileNotice: [],
     result: null,
-    running: null
+    running: null,
+    today: null,            // 오늘 대진 {format, savedAt, appVersion, date, settings, current, rounds} (저장소와 같은 내용, 저장이 안 되는 브라우저에서도 이 화면 동안은 씀)
+    restForm: null          // 진행 중 변경 화면의 입력 {T, changes: {이름: {kind, time}}, newcomers: [...]}
   };
 
   // ── 작은 도우미 ─────────────────────────────────────────
@@ -78,13 +84,13 @@
   }
 
   // ── 화면 전환 ───────────────────────────────────────────
-  var VIEWS = ["home", "settings", "roster", "result"];
+  var VIEWS = ["home", "settings", "roster", "result", "rest"];
   var currentView = "home";
 
   function show(view) {
     currentView = view;
     VIEWS.forEach(function (v) { $("view-" + v).hidden = v !== view; });
-    if (view === "result") updateStale();
+    if (view === "result") { updateStale(); refreshResultButtons(); }
     refreshSteps();
     window.scrollTo(0, 0);
   }
@@ -107,7 +113,7 @@
 
   function refreshSteps() {
     $("step-msg").textContent = "";
-    var idx = VIEWS.indexOf(currentView);
+    var idx = VIEWS.indexOf(currentView === "rest" ? "result" : currentView);   // 진행 중 변경은 ③ 결과 위에 겹친 화면
     document.querySelectorAll(".steps [data-step]").forEach(function (b) {
       var step = b.getAttribute("data-step");
       var i = VIEWS.indexOf(step);
@@ -124,6 +130,7 @@
     var why = stepLock(step);
     if (why) { $("step-msg").textContent = why; return; }
     if (step === currentView) return;
+    if (currentView === "rest" && state.running) return;
     if (step === "settings") enterSettings();
     else if (step === "roster") enterRoster();
     else if (step === "result") show("result");
@@ -527,7 +534,57 @@
     }
   }
 
+  // ── 오늘 대진 (plan_w7.md 2.2: 이름으로 저장, 재편성 회차마다 직전 바탕을 함께) ─────
+  function loadToday() {
+    try {
+      var raw = window.localStorage.getItem(TODAY_KEY);
+      if (!raw) return null;
+      var d = JSON.parse(raw);
+      if (!d || d.format !== TODAY_FORMAT || !d.current || !Array.isArray(d.current.rows) || !Array.isArray(d.rounds)) return null;
+      return d;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveToday(d) {
+    state.today = d;
+    try {
+      d.savedAt = new Date().toISOString();
+      window.localStorage.setItem(TODAY_KEY, JSON.stringify(d));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function todayData() { return state.today || loadToday(); }
+
+  function plainRoster(roster) {
+    return roster.map(function (p) { return { name: p.name, gender: p.gender, grade: p.grade, arrival: p.arrival || "", leave: p.leave || "" }; });
+  }
+
+  function plainRows(rows) {
+    return rows.map(function (r) { return { slot: r.slot, court: r.court, type: r.type, t1: r.t1.slice(), t2: r.t2.slice() }; });
+  }
+
+  // 결과(state.result)를 저장할 수 있는 모양으로
+  function currentOf(R) {
+    return { seed: R.seed, version: R.version, roster: plainRoster(R.roster), rows: plainRows(R.rows), meta: R.meta };
+  }
+
   function renderHome() {
+    var td = loadToday();
+    var tb = $("home-today");
+    if (td && td.date === todayStr()) {
+      tb.hidden = false;
+      $("home-today-hint").hidden = false;
+      $("home-today-hint").textContent = "오늘 대진: 대진 번호 " + td.current.seed + " · " + td.current.roster.length + "명" +
+        (td.rounds.length ? " · 진행 중 변경 " + td.rounds.length + "회" : "");
+    } else {
+      tb.hidden = true;
+      $("home-today-hint").hidden = true;
+    }
     var last = loadLast();
     var btn = $("home-last");
     if (!last.ok) {
@@ -675,7 +732,8 @@
     return {
       version: map["앱 버전"], seed: map["대진 번호"] || "", date: map["날짜"] || "", start: map["시작 시각"] || "",
       end: map["종료 시각"] || "", minutes: map["경기 시간(분)"] || "", courts: map["코트 수"] || "",
-      maxGames: map["1인당 최대 경기 수"] || "", slots: map["시간대 수"] || ""
+      maxGames: map["1인당 최대 경기 수"] || "", slots: map["시간대 수"] || "",
+      rest: !!wb.getWorksheet("재편성 기록"), firstSeed: map["처음 대진 번호"] || ""   // 재편성 결과 파일 (Q6)
     };
   }
 
@@ -693,7 +751,9 @@
     if (hm(fs.start)) s.start = hm(fs.start);
     if (/^\d+$/.test(fs.minutes)) s.minutes = parseInt(fs.minutes, 10);
     if (/^\d+$/.test(fs.courts)) s.courts = parseInt(fs.courts, 10);
-    var same = fs.version === Scheduler.SCHEDULER_VERSION;
+    // 2.0.0과 2.1.0은 재편성 없는 대진의 생성 규칙이 같다 (plan_w7 2.7, Q5). 재편성 결과 파일은 번호로 다시 만들 수 없다 (Q6)
+    var sameRule = Scheduler.SAME_RULE_VERSIONS.indexOf(fs.version) >= 0;
+    var same = sameRule && !fs.rest;
     var v1 = /^1\./.test(fs.version);
     if (hm(fs.end)) s.end = hm(fs.end);
     else if (v1 && /^\d+$/.test(fs.slots)) s.end = Scheduler.slotTime(s.start, s.minutes, parseInt(fs.slots, 10));
@@ -701,10 +761,18 @@
     fillSettingsInputs(s);
     state.settings = s;
     if (same && /^\d{6}$/.test(fs.seed)) $("set-seed").value = fs.seed;
+    else if (fs.rest) $("set-seed").value = "";   // 재편성 파일: 앞의 번호가 남아 다른 대진이 만들어지지 않게 비운다 (Q6, W7 시험 중 결함 1)
     state.fileNotice.push("불러온 파일의 설정(" + s.start + "–" + s.end + ", " + s.minutes + "분, " + s.courts + "면" +
       (s.maxGames ? ", 1인당 최대 " + s.maxGames + "경기" : "") + ")을 ① 설정에 채웠습니다." +
       (same && /^\d{6}$/.test(fs.seed) ? " 대진 번호 " + fs.seed + "도 채웠습니다." : ""));
-    if (!same) state.fileNotice.push("⚠ 이 파일은 앱 버전 " + fs.version + "로 만들었고 지금은 " + Scheduler.SCHEDULER_VERSION + "입니다. 앱 버전이 달라 같은 대진이 나오지 않습니다. 명단과 설정만 불러왔습니다.");
+    if (fs.rest) {
+      state.fileNotice.push("⚠ 진행 중에 바꾼 대진은 파일로 다시 만들 수 없습니다(대진을 만든 기기에서만 이어서 바꿀 수 있습니다). 명단과 설정만 불러왔습니다." +
+        (/^\d{6}$/.test(fs.firstSeed) ? " 처음 대진은 대진 번호 " + fs.firstSeed + "로 다시 볼 수 있습니다." : ""));
+    } else if (sameRule && fs.version !== Scheduler.SCHEDULER_VERSION) {
+      state.fileNotice.push("이 파일은 앱 버전 " + fs.version + "으로 만들었습니다. " + Scheduler.SCHEDULER_VERSION + "은 진행 중 변경만 더했으므로 같은 대진이 나옵니다.");
+    } else if (!same) {
+      state.fileNotice.push("⚠ 이 파일은 앱 버전 " + fs.version + "로 만들었고 지금은 " + Scheduler.SCHEDULER_VERSION + "입니다. 앱 버전이 달라 같은 대진이 나오지 않습니다. 명단과 설정만 불러왔습니다.");
+    }
     state.fileSettings = null;   // 한 번만 채운다
   }
 
@@ -760,6 +828,10 @@
     var rs = readSettings();
     if (rs.errors.length) { enterSettings(); return; }
     if (!rosterStatus().ok) { enterRoster(); return; }
+    // Q1 (검토 반영): 오늘 대진에 진행 중 변경이 있으면 덮어쓰기 전에 묻는다 (생성 전에)
+    var td = todayData();
+    if (td && td.rounds.length &&
+        !window.confirm("오늘 대진에 진행 중 변경이 " + td.rounds.length + "회 있습니다. 새 대진을 만들면 그 기록이 지워집니다. 새로 만들까요?")) return;
     var s = rs.s;
     var players = validPlayers();
     var roster = Scheduler.sortRoster(players);   // 7절: 입력 순서와 관계없이 같은 대진
@@ -796,6 +868,10 @@
       if (!res) return;
       if (!res.ok) return showFailure(res, roster, s, seed);
       buildResult(res, roster, s, seed);
+      // 오늘 대진으로 저장 (재편성 기록은 지움, Q1)
+      saveToday({ format: TODAY_FORMAT, appVersion: Scheduler.SCHEDULER_VERSION, date: s.date,
+        settings: { start: s.start, end: s.end, minutes: s.minutes, courts: s.courts, maxGames: s.maxGames },
+        current: currentOf(state.result), rounds: [] });
       show("result");
     }
 
@@ -830,66 +906,133 @@
     return [team[1], team[0]];
   }
 
-  function buildResult(res, roster, s, seed) {
-    var score = Scheduler.GRADE_SCORE;
-    var genderOf = {};
-    roster.forEach(function (p) { genderOf[p.name] = p.gender; });
-    var matches = res.matches.slice().sort(function (a, b) { return (a.slot - b.slot) || (a.court - b.court); });
-    var rows = matches.map(function (m, i) {
-      var t1 = m.t1.map(function (p) { return roster[p].name; });
-      var t2 = m.t2.map(function (p) { return roster[p].name; });
-      var s1 = m.t1.reduce(function (a, p) { return a + score[roster[p].grade]; }, 0);
-      var s2 = m.t2.reduce(function (a, p) { return a + score[roster[p].grade]; }, 0);
-      return { no: i + 1, slot: m.slot, time: Scheduler.slotTime(s.start, s.minutes, m.slot), court: m.court,
-        t1: t1, t2: t2, type: m.type, s1: s1, s2: s2,
-        show1: shownTeam(t1, m.type, genderOf), show2: shownTeam(t2, m.type, genderOf) };   // 화면·이미지용
+  // 생성 결과(번호) → 저장·표시용 이름 행
+  function nameRows(matches, roster) {
+    return matches.map(function (m) {
+      return { slot: m.slot, court: m.court, type: m.type, t1: m.t1.map(function (p) { return roster[p].name; }), t2: m.t2.map(function (p) { return roster[p].name; }) };
     });
+  }
+
+  function byNameMap(roster, arr) {
+    var o = {};
+    roster.forEach(function (p, i) { o[p.name] = arr[i]; });
+    return o;
+  }
+
+  function textRows(rows, s) {
+    return rows.map(function (r, i) {
+      return { no: i + 1, time: Scheduler.slotTime(s.start, s.minutes, r.slot), court: r.court, t1: r.t1, t2: r.t2, type: r.type };
+    });
+  }
+
+  function buildResult(res, roster, s, seed) {
+    var meta = { M: res.M, upper: res.upper, ub: res.ub, reductions: res.reductions, repeatOpp: res.repeatOpp, found: res.found, tries: res.tries,
+      q: byNameMap(roster, res.q), target: byNameMap(roster, res.target) };
+    state.result = makeResult({ settings: s, seed: seed, version: res.version, roster: roster, rows: nameRows(res.matches, roster), meta: meta });
+    renderResult();
+  }
+
+  /*
+   * 저장된 값(이름 행)으로 결과를 만든다. 새로 만든 대진·재편성·"오늘 대진 이어서" 모두 이 함수를 지난다 (6.8.1: 바탕은 값 자체).
+   * o: {settings, seed, version, roster, rows: [{slot, court, type, t1, t2}], meta, rest: null | {n, T, baseSeed, baseRows, history}}
+   */
+  function makeResult(o) {
+    var s = o.settings, roster = o.roster, meta = o.meta || {};
+    var score = Scheduler.GRADE_SCORE;
+    var genderOf = {}, gradeOf = {};
+    roster.forEach(function (p) { genderOf[p.name] = p.gender; gradeOf[p.name] = p.grade; });
+    var sorted = o.rows.slice().sort(function (a, b) { return (a.slot - b.slot) || (a.court - b.court); });
+    var rows = sorted.map(function (m, i) {
+      var s1 = m.t1.reduce(function (a, p) { return a + score[gradeOf[p]]; }, 0);
+      var s2 = m.t2.reduce(function (a, p) { return a + score[gradeOf[p]]; }, 0);
+      return { no: i + 1, slot: m.slot, time: Scheduler.slotTime(s.start, s.minutes, m.slot), court: m.court,
+        t1: m.t1.slice(), t2: m.t2.slice(), type: m.type, s1: s1, s2: s2,
+        show1: shownTeam(m.t1, m.type, genderOf), show2: shownTeam(m.t2, m.type, genderOf) };   // 화면·이미지용
+    });
+    var S = Scheduler.slots(s).S;
+    var loads = [];
+    for (var t = 0; t < S; t++) loads.push(0);
     var games = {}, slotsOf = {};
     roster.forEach(function (p) { games[p.name] = 0; slotsOf[p.name] = {}; });
-    rows.forEach(function (r) { r.t1.concat(r.t2).forEach(function (p) { games[p] += 1; slotsOf[p][r.slot] = true; }); });
-    var iv = res.iv;
+    rows.forEach(function (r) { loads[r.slot] += 1; r.t1.concat(r.t2).forEach(function (p) { games[p] += 1; slotsOf[p][r.slot] = true; }); });
+    var iv = Scheduler.intervals(roster, s);
+    var rest = o.rest || null, rm = meta.rest || null;
+    function dbl(name, from) {
+      var k = 0;
+      for (var t2 = from; t2 < S - 1; t2++) if (slotsOf[name][t2] && slotsOf[name][t2 + 1]) k++;
+      return k;
+    }
     var people = roster.map(function (p, i) {
       var x = iv.people[i];
-      return { name: p.name, gender: p.gender, grade: p.grade, arrival: p.arrival, leave: p.leave,
+      var o2 = { name: p.name, gender: p.gender, grade: p.grade, arrival: p.arrival, leave: p.leave,
         arrivalShown: p.arrival || s.start, leaveShown: p.leave || s.end,
-        f: x.f, l: x.l, m: x.m, late: x.late, early: x.early, q: res.q[i], target: res.target[i],
-        games: games[p.name], doubles: res.doubles[i], slots: slotsOf[p.name] };
+        f: x.f, l: x.l, m: x.m, late: x.late, early: x.early, q: (meta.q || {})[p.name], target: (meta.target || {})[p.name],
+        games: games[p.name], doubles: dbl(p.name, 0), slots: slotsOf[p.name] };
+      if (rest && rm) {
+        o2.change = rm.changeOf[p.name] || "same";
+        o2.g0 = rm.g0[p.name]; o2.rho = rm.rho[p.name]; o2.r = rm.r[p.name];
+        o2.restDoubles = dbl(p.name, rest.T);
+        o2.q = o2.g0 + o2.rho;            // 하루 몫 = 지금까지 + 남은 몫
+        o2.target = o2.g0 + o2.r;
+      }
+      return o2;
     });
     var byName = {};
     people.forEach(function (p) { byName[p.name] = p; });
     var opts = { start: s.start, end: s.end, minutes: s.minutes, courts: s.courts, maxGames: s.maxGames };
-    state.result = {
+    var dayDoubles = people.reduce(function (a, p) { return a + p.doubles; }, 0);
+    var R = {
       settings: s,
-      seed: seed,
-      version: res.version,
+      seed: o.seed,
+      version: o.version,
       roster: roster,
       people: people,
       byName: byName,
       rows: rows,
       games: games,
-      S: res.S,
-      M: res.M,
-      upper: res.upper,
-      ub: res.ub,
-      loads: res.loads,
-      reductions: res.reductions,
-      totalDoubles: res.totalDoubles,
-      repeatOpp: res.repeatOpp,
-      found: res.found,
-      tries: res.tries,
+      S: S,
+      M: meta.M,
+      upper: meta.upper,
+      ub: meta.ub,
+      loads: loads,
+      reductions: meta.reductions || [],
+      totalDoubles: rest ? people.reduce(function (a, p) { return a + p.restDoubles; }, 0) : dayDoubles,
+      dayDoubles: dayDoubles,
+      repeatOpp: meta.repeatOpp,
+      found: meta.found,
+      tries: meta.tries,
+      meta: meta,
+      rest: rest,
       lateCount: people.filter(function (p) { return p.late; }).length,
       earlyCount: people.filter(function (p) { return p.early; }).length,
-      lastEnd: lastEndText(s, res.loads),
-      check: Checker.check(roster, rows, opts),
-      snapshot: snapshot(roster, s, seed)          // 나중에 명단·설정이 바뀌었는지 비교
+      lastEnd: lastEndText(s, loads),
+      check: rest ? Checker.checkRest(roster, textRows(rest.baseRows, s), textRows(rows, s), opts, rest.T) : Checker.check(roster, rows, opts),
+      snapshot: snapshot(roster, s, o.seed)          // 나중에 명단·설정이 바뀌었는지 비교
     };
-    renderResult();
+    return R;
   }
 
   function summaryText(R) {
     var s = R.settings;
+    if (R.rest) {
+      return R.roster.length + "명 · " + s.courts + "면 · 하루 " + R.rows.length + "경기(남은 " + R.M + "경기) · 빈 코트 " + (s.courts * R.S - R.rows.length) +
+        " · 남은 2연속 " + R.totalDoubles + "회";
+    }
     return R.roster.length + "명 · " + s.courts + "면 · " + R.rows.length + "경기 · 빈 코트 " + (s.courts * R.S - R.rows.length) +
       " · 2연속 " + R.totalDoubles + "회" + (R.lateCount ? " · 늦게 옴 " + R.lateCount + "명" : "") + (R.earlyCount ? " · 일찍 감 " + R.earlyCount + "명" : "");
+  }
+
+  // "재편성 N회 · HH:MM 기준" (8.1 결과)
+  function restLine(R) {
+    var s = R.settings;
+    return "재편성 " + R.rest.n + "회 · " + Scheduler.slotTime(s.start, s.minutes, R.rest.T) + " 기준";
+  }
+
+  // R1 설명 (Q7 검토 반영: 실패 안내가 아니라 미리보기·결과 화면의 설명)
+  function boundaryNoteText(note, s) {
+    if (!note) return "";
+    return Scheduler.slotTime(s.start, s.minutes, note.slot) + "에는 " + (note.games ? note.games + "경기만" : "경기를 하지 않고") +
+      " 합니다. 방금 두 경기를 이어서 한 " + note.rested + "명은 쉬어야 합니다.";
   }
 
   function renderResult() {
@@ -902,6 +1045,15 @@
      ["시간", s.start + " ~ " + endFull + (R.lastEnd && R.lastEnd !== endFull ? " (실제 마지막 경기 종료 " + R.lastEnd + ")" : "")]].forEach(function (x) {
       meta.appendChild(el("span", null, [x[0] + " ", el("b", { text: String(x[1]) })]));
     });
+    var ri = $("result-rest-info");
+    clear(ri);
+    if (R.rest) {
+      ri.appendChild(el("p", null, [el("b", { text: restLine(R) }), " · 대진 번호 " + R.seed + " (바탕 " + R.rest.baseSeed + ")"]));
+      ri.appendChild(el("p", { class: "hint", text: "회색 시간대는 이미 진행된 경기입니다(대진표대로 한 것으로 봅니다). 그 뒤 시간대를 다시 짰습니다." }));
+      var nt = boundaryNoteText(R.meta.rest.note, s);
+      if (nt) ri.appendChild(el("p", { class: "late-line", text: nt }));
+    }
+    ri.hidden = !R.rest;
     $("result-summary").textContent = summaryText(R);
 
     // 6.6 M 줄임 · 계산으로 정해진 빈 코트 이유
@@ -909,7 +1061,11 @@
     clear(red);
     var full = s.courts * R.S;
     var empty = full - R.rows.length;
-    if (R.M < R.upper) {
+    if (R.rest) {
+      if (R.M < R.upper) {
+        red.appendChild(el("p", null, [el("b", { text: "남은 시간을 모두 채우는 대진을 찾지 못해 남은 경기를 " + R.M + "경기로 만들었습니다(계산한 최대 " + R.upper + "경기)." })]));
+      }
+    } else if (R.M < R.upper) {
       var why = R.reductions.map(function (r) { return r.reason; });
       red.appendChild(el("p", null, [el("b", { text: "코트를 모두 채우는 대진을 찾지 못해 " + R.M + "경기로 만들었습니다(빈 코트 " + empty + "칸)." })]));
       red.appendChild(el("p", { class: "hint", text: "계산한 최대 " + R.upper + "경기에서 줄인 이유: " +
@@ -917,7 +1073,7 @@
         (why.indexOf("search") >= 0 && why.indexOf("parity") >= 0 ? ", " : "") +
         (why.indexOf("parity") >= 0 ? "남자·여자 출전 합을 짝수로 맞춤" : "") + "." }));
     }
-    if (R.upper < full) {
+    if (!R.rest && R.upper < full) {
       var pl = { ub: Object.assign({ M: R.upper }, R.ub), parityDrops: R.reductions.filter(function (r) { return r.reason === "parity" && r.from > R.M && R.M === r.to; }).map(function (r) { return r.from; }) };
       var why2 = emptyReasons(pl, s);
       if (why2.length) {
@@ -948,7 +1104,12 @@
     var ivBox = $("result-iv");
     clear(ivBox);
     var diff = R.people.filter(function (p) { return p.late || p.early; });
-    if (diff.length) {
+    if (R.rest) {
+      // 지금까지 g0 + 남은 r = 하루 합계 (변동이 있는 사람·남은 경기 0인 사람을 먼저)
+      ivBox.appendChild(el("p", null, [el("b", { text: "사람별 경기 수 (지금까지 + 남은 = 하루 합계)" })]));
+      ivBox.appendChild(restTable(R.people, R.meta.rest.lambda));
+      ivBox.hidden = false;
+    } else if (diff.length) {
       ivBox.appendChild(el("p", null, [el("b", { text: "늦게 오거나 일찍 가는 사람 " + diff.length + "명" })]));
       var lt = el("table");
       lt.appendChild(el("tr", null, ["이름", "참가", "퇴장", "참여 시간대", "몫", "실제"].map(function (h) { return el("th", { text: h }); })));
@@ -958,7 +1119,7 @@
       ivBox.appendChild(el("div", { class: "table-wrap" }, [lt]));
       ivBox.appendChild(el("p", { class: "hint", text: "몫 = 출전 자리(4 × 총 경기 수)를 참여 시간대 수에 비례해 나눈 값. 실제 경기 수는 몫의 내림 또는 올림입니다." }));
     }
-    ivBox.hidden = !diff.length;
+    if (!R.rest) ivBox.hidden = !diff.length;
 
     renderGrid();
     renderMineOptions();
@@ -979,7 +1140,10 @@
     var bySlot = {};
     R.rows.forEach(function (r) { bySlot[r.slot + ":" + r.court] = r; });
     for (var slot = 0; slot < R.S; slot++) {
-      var tr = el("tr", null, [el("th", { text: Scheduler.slotTime(s.start, s.minutes, slot) + "~" + Scheduler.slotTime(s.start, s.minutes, slot + 1) })]);
+      var done = R.rest && slot <= R.rest.T;   // 진행된 시간대 (Q2: 회색 + "진행됨")
+      var th = el("th", { text: Scheduler.slotTime(s.start, s.minutes, slot) + "~" + Scheduler.slotTime(s.start, s.minutes, slot + 1) });
+      if (done) th.appendChild(el("div", { class: "done-tag", text: "진행됨" }));
+      var tr = el("tr", done ? { class: "fixed" } : null, [th]);
       if (!R.loads[slot]) {
         // D3: 경기가 하나도 없는 시간대는 줄 전체에 한 문구
         tr.appendChild(el("td", { class: "noslot", colspan: String(s.courts), text: "이 시간에는 경기 없음" }));
@@ -1029,6 +1193,8 @@
     var p = R.byName[name];
     var mine = R.rows.filter(function (r) { return r.t1.indexOf(name) >= 0 || r.t2.indexOf(name) >= 0; });
     box.appendChild(el("p", null, [el("b", { text: name }), " 님은 " + mine.length + "경기입니다." + (p.doubles ? " (2연속 " + p.doubles + "회)" : "")]));
+    if (R.rest) box.appendChild(el("p", { class: "late-line", text: "지금까지 " + p.g0 + "경기 + 남은 " + p.r + "경기 = 하루 " + (p.g0 + p.r) + "경기" +
+      (p.change !== "same" ? " · " + CHANGE_LABEL[p.change === "absent-played" ? "absent" : p.change] : "") }));
     if (p.late || p.early) box.appendChild(el("p", { class: "late-line", text: "참여 " + intervalLabel(s, p.f, p.l) + " (참가 " + p.arrivalShown + " · 퇴장 " + p.leaveShown + ") · 몫 " + p.q.toFixed(2) + "경기" }));
     var t = el("table");
     t.appendChild(el("tr", null, ["시간", "코트", "파트너", "상대", "종류"].map(function (h) { return el("th", { text: h }); })));
@@ -1038,7 +1204,9 @@
       var partner = myTeam.filter(function (x) { return x !== name; })[0];
       var timeCell = el("td", null, [r.time]);
       if (p.slots[r.slot - 1] || p.slots[r.slot + 1]) timeCell.appendChild(el("span", { class: "dbl", text: "연속" }));   // 2연속인 경기
-      t.appendChild(el("tr", null, [
+      var done = R.rest && r.slot <= R.rest.T;
+      if (done) timeCell.appendChild(el("span", { class: "done-tag", text: "진행됨" }));
+      t.appendChild(el("tr", done ? { class: "fixed" } : null, [
         timeCell, el("td", { text: String(r.court) }),
         el("td", { text: partner }), el("td", { text: other.join(" · ") }), el("td", { text: r.type })
       ]));
@@ -1052,6 +1220,450 @@
     });
     $("rtab-grid").hidden = tab !== "grid";
     $("rtab-mine").hidden = tab !== "mine";
+  }
+
+  // ── 진행 중 재편성 (6.8, 8.1, plan_w7.md 2.9) ─────────────────────
+  function fracNum(x) { return x && x.d ? x.n / x.d : 0; }
+
+  // 화면·Excel에 보일 때만 약분 (계산은 scheduler.js의 분자/분모 그대로)
+  function fracText(x) {
+    if (!x || !x.d) return "-";
+    var a = Math.abs(x.n), b = x.d;
+    while (b) { var t = a % b; a = b; b = t; }
+    var g = a || 1;
+    return (x.n / g) + "/" + (x.d / g);
+  }
+
+  // 사람별 "지금까지 + 남은 = 하루 합계" 표. 변동이 있는 사람 → 남은 경기 0인 사람 → 나머지 (8.1-3)
+  function restTable(people, lambda) {
+    var order = people.slice().sort(function (a, b) {
+      var ka = a.change !== "same" ? 0 : (a.r === 0 ? 1 : 2), kb = b.change !== "same" ? 0 : (b.r === 0 ? 1 : 2);
+      return (ka - kb) || cmpName(a.name, b.name);
+    });
+    var t = el("table", { class: "rest-people" });
+    t.appendChild(el("tr", null, ["이름", "변동", "지금까지", "남은 몫", "남은", "하루 합계"].map(function (h) { return el("th", { text: h }); })));
+    order.forEach(function (p) {
+      var ch = p.change === "absent-played" ? "불참(지난 경기 그대로)" : CHANGE_LABEL[p.change] || "그대로";
+      t.appendChild(el("tr", p.change !== "same" ? { class: "changed" } : null,
+        [p.name, ch, p.g0 + "경기", p.rho.toFixed(2), p.r + "경기", (p.g0 + p.r) + "경기"].map(function (v) { return el("td", { text: String(v) }); })));
+    });
+    var wrap = el("div", { class: "table-wrap" }, [t]);
+    if (lambda) wrap.appendChild(el("p", { class: "hint", text: "남은 몫 = λ × 참여 시간대 수 − 지금까지 경기 (0 이상, 할 수 있는 최대 이하). λ = " +
+      fracText(lambda) + " ≈ " + fracNum(lambda).toFixed(3) + " (참여 시간대 1칸당 경기 수, 모두에게 같음)" }));
+    return wrap;
+  }
+
+  function cmpName(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+
+  // [진행 중 변경]을 쓸 수 있는지 (2절: 이 기기에서 만든 대진만)
+  function restLock() {
+    if (!state.result) return "대진표가 없습니다.";
+    if (isStale()) return "명단·설정이 바뀌어 지금 대진과 맞지 않습니다. [다시 만들기]를 누르거나 원래대로 돌려 주세요.";
+    if (state.running) return "대진을 찾는 중입니다.";
+    return "";
+  }
+
+  function refreshResultButtons() {
+    var R = state.result;
+    if (!R) return;
+    $("result-undo").hidden = !R.rest;
+    $("result-again").textContent = R.rest ? "같은 변동, 새 번호로 다시 짜기" : "다시 만들기 (새 번호)";
+    var why = restLock();
+    $("result-rest").disabled = !!why;
+    $("result-rest-msg").textContent = why && R ? why : "";
+  }
+
+  // 진행 중 변경 화면이 바탕으로 보는 결과 (보통은 지금 결과, "같은 변동으로 다시 짜기"는 마지막 회차의 바탕)
+  var restViewBase = null;
+  function viewBase() { return restViewBase || state.result; }
+
+  function renderRestView(R) { restViewBase = R; renderRest(); }
+
+  // 바탕 = 지금 결과 자체 (6.8.1)
+  function restBase() {
+    var R = viewBase();
+    return { roster: plainRoster(R.roster), rows: plainRows(R.rows), seed: R.seed };
+  }
+
+  function nowMinutes() {
+    if (window.__W7_NOW__) return window.__W7_NOW__;      // 시험용으로 시각을 정할 수 있게 (시험 페이지만 씀)
+    var d = new Date();
+    return d.getHours() * 60 + d.getMinutes();
+  }
+
+  // 2.3 기준 시간대 기본값. "" = 기본값 없음(날짜가 오늘이 아님), -1 = 시작 전
+  function defaultT(s, minT) {
+    if (s.date !== todayStr()) return "";
+    var st = Scheduler.parseHM(s.start), S = Scheduler.slots(s).S, now = nowMinutes();
+    var T;
+    if (now < st) T = -1;
+    else T = Math.min(S - 1, Math.floor((now - st) / s.minutes));
+    return Math.max(T, minT);
+  }
+
+  function enterRest() {
+    var why = restLock();
+    if (why) { $("result-rest-msg").textContent = why; return; }
+    var R = state.result, s = R.settings;
+    var minT = R.rest ? R.rest.T : -1;                    // Q14: 직전 회차의 T보다 앞은 고를 수 없음
+    restViewBase = null;
+    state.restForm = { T: defaultT(s, minT), minT: minT, changes: {}, newcomers: [], seed: "" };
+    $("rest-seed").value = "";
+    $("rest-fail").hidden = true;
+    $("rest-status").hidden = true;
+    renderRest();
+    show("rest");
+  }
+
+  function restT() { var v = state.restForm.T; return v === "" ? null : Number(v); }
+
+  function slotLabel(s, t) {
+    return Scheduler.slotTime(s.start, s.minutes, t) + " 경기 중 (" + Scheduler.slotTime(s.start, s.minutes, t) + "–" + Scheduler.slotTime(s.start, s.minutes, t + 1) + ")";
+  }
+
+  function renderRest() {
+    var R = viewBase(), s = R.settings, F = state.restForm, S = R.S;
+    // 1. 기준 시간대
+    var sel = $("rest-T");
+    clear(sel);
+    if (F.T === "") sel.appendChild(el("option", { value: "", text: "기준 시간을 고르세요" }));
+    if (F.minT < 0) sel.appendChild(el("option", { value: "-1", text: "시작 전" }));
+    for (var t = Math.max(0, F.minT); t < S; t++) sel.appendChild(el("option", { value: String(t), text: slotLabel(s, t) }));
+    sel.value = String(F.T);
+    $("rest-round").textContent = R.rest ? "이번이 " + (R.rest.n + 1) + "번째 변경입니다 (직전 기준 " + Scheduler.slotTime(s.start, s.minutes, R.rest.T) + ")." : "";
+    renderRestGrid();
+    renderRestPeople();
+    renderRestPreview();
+  }
+
+  // 고정되는 시간대를 작은 격자에서 회색으로 (8.1-1)
+  function renderRestGrid() {
+    var R = viewBase(), s = R.settings, T = restT();
+    var box = $("rest-grid");
+    clear(box);
+    var tbl = el("table", { class: "grid mini" });
+    var bySlot = {};
+    R.rows.forEach(function (r) { (bySlot[r.slot] = bySlot[r.slot] || []).push(r); });
+    for (var slot = 0; slot < R.S; slot++) {
+      var fixed = T !== null && slot <= T;
+      var cells = (bySlot[slot] || []).map(function (r) { return r.show1.concat(r.show2).join(", "); });
+      tbl.appendChild(el("tr", fixed ? { class: "fixed" } : null, [
+        el("th", { text: Scheduler.slotTime(s.start, s.minutes, slot) }),
+        el("td", { class: "left", text: (fixed ? "진행됨 · " : "") + (cells.length ? cells.join(" / ") : "경기 없음") })
+      ]));
+    }
+    box.appendChild(tbl);
+  }
+
+  // 0…T에 뛴 경기 수
+  function playedUntil(T) {
+    var R = viewBase(), g = {};
+    R.roster.forEach(function (p) { g[p.name] = 0; });
+    if (T === null) return g;
+    R.rows.forEach(function (r) { if (r.slot <= T) r.t1.concat(r.t2).forEach(function (x) { g[x] += 1; }); });
+    return g;
+  }
+
+  // 시각 풀다운: arrival = t_(T+1)…t_(S−1), leave = t_(T+1)("지금 경기 끝나고")…t_(S−1)
+  function restTimeOptions(kind, s, T, S) {
+    var out = [];
+    for (var k = T + 1; k < S; k++) {
+      var v = Scheduler.slotTime(s.start, s.minutes, k);
+      out.push({ value: v, text: v + (kind === "leave" && k === T + 1 ? " (지금 경기 끝나고)" : "") });
+    }
+    return out;
+  }
+
+  function optionSelect(opts, value, onChange, label) {
+    var sel = el("select", label ? { "aria-label": label } : null);
+    opts.forEach(function (o) {
+      var op = el("option", { value: o.value, text: o.text });
+      if (o.disabled) op.disabled = true;
+      sel.appendChild(op);
+    });
+    sel.value = value;
+    sel.addEventListener("change", function () { onChange(sel.value); });
+    return sel;
+  }
+
+  function renderRestPeople() {
+    var R = viewBase(), s = R.settings, F = state.restForm, T = restT(), S = R.S;
+    var body = $("rest-body");
+    clear(body);
+    var g = playedUntil(T);
+    var tOk = T !== null && T >= 0 && T < S - 1;
+    R.roster.forEach(function (p, i) {
+      var c = F.changes[p.name] || { kind: "same" };
+      var x = R.people[i];
+      var gone = x.l <= (T === null ? -1 : T);        // 이미 퇴장 시각이 지남
+      var opts = [
+        { value: "same", text: "그대로" },
+        { value: "absent", text: "불참" },
+        { value: "arrival", text: "참가 시각 변경", disabled: !tOk || g[p.name] > 0 },
+        { value: "leave", text: "일찍 감", disabled: !tOk || gone }
+      ];
+      var stSel = optionSelect(opts, c.kind, function (v) {
+        if (v === "same") delete F.changes[p.name];
+        else F.changes[p.name] = { kind: v, time: v === "arrival" || v === "leave" ? Scheduler.slotTime(s.start, s.minutes, T + 1) : "" };
+        renderRestPeople(); renderRestPreview();
+      }, p.name + " 상태");
+      var timeCell = el("td");
+      if ((c.kind === "arrival" || c.kind === "leave") && tOk) {
+        timeCell.appendChild(optionSelect(restTimeOptions(c.kind, s, T, S), c.time, function (v) { c.time = v; renderRestPreview(); }, p.name + " 시각"));
+      }
+      var note = el("td", { class: "warn" });
+      if (c.kind === "absent" && g[p.name] > 0) note.textContent = "지난 경기는 그대로 두고, 지금 경기 뒤로는 빠집니다";
+      body.appendChild(el("tr", c.kind !== "same" ? { class: "changed" } : null, [
+        el("td", { text: p.name }), el("td", { text: T === null ? "-" : g[p.name] + "경기" }), el("td", null, [stSel]), timeCell, note
+      ]));
+    });
+    // 새로 온 사람
+    F.newcomers.forEach(function (nc, k) {
+      var name = el("input", { type: "text", placeholder: "이름", "aria-label": "새로 온 사람 이름" });
+      name.value = nc.name;
+      name.addEventListener("input", function () { nc.name = name.value.trim(); renderRestPreview(); });
+      var gsel = choiceSelect(GENDERS, nc.gender, function (v) { nc.gender = v; renderRestPreview(); });
+      var ksel = choiceSelect(GRADES, nc.grade, function (v) { nc.grade = v; renderRestPreview(); });
+      var times = el("div", { class: "row tight" });
+      if (tOk) {
+        times.appendChild(el("span", { text: "참가" }));
+        times.appendChild(optionSelect(restTimeOptions("arrival", s, T, S), nc.arrival, function (v) { nc.arrival = v; renderRestPreview(); }, "새로 온 사람 참가 시각"));
+        var lopts = [{ value: "", text: s.end + "(끝까지)" }];
+        for (var q = T + 2; q < S; q++) lopts.push({ value: Scheduler.slotTime(s.start, s.minutes, q), text: Scheduler.slotTime(s.start, s.minutes, q) });
+        times.appendChild(el("span", { text: "퇴장" }));
+        times.appendChild(optionSelect(lopts, nc.leave, function (v) { nc.leave = v; renderRestPreview(); }, "새로 온 사람 퇴장 시각"));
+      }
+      var del = el("button", { type: "button", class: "subtle", text: "삭제" });
+      del.addEventListener("click", function () { F.newcomers.splice(k, 1); renderRestPeople(); renderRestPreview(); });
+      body.appendChild(el("tr", { class: "changed newcomer" }, [
+        el("td", null, [name]), el("td", { text: "새로 옴" }), el("td", null, [gsel, ksel]), el("td", null, [times]), el("td", null, [del])
+      ]));
+    });
+    $("rest-add").disabled = !tOk;
+    var n = Object.keys(F.changes).length + F.newcomers.length;
+    $("rest-changes-sum").textContent = n ? "변동 " + n + "명: " + changeTexts().join(", ") : "변동 없음 (남은 대진을 새 번호로 다시 짭니다)";
+  }
+
+  // 화면 입력 → Scheduler 변동 목록
+  function restChanges() {
+    var F = state.restForm, out = [];
+    Object.keys(F.changes).sort().forEach(function (name) {
+      var c = F.changes[name];
+      if (c.kind === "absent") out.push({ kind: "absent", name: name });
+      else if (c.kind === "arrival") out.push({ kind: "arrival", name: name, arrival: c.time });
+      else if (c.kind === "leave") out.push({ kind: "leave", name: name, leave: c.time });
+    });
+    F.newcomers.forEach(function (nc) {
+      out.push({ kind: "new", name: nc.name, gender: nc.gender, grade: nc.grade, arrival: nc.arrival, leave: nc.leave });
+    });
+    return out;
+  }
+
+  function changeText(c) {
+    if (c.kind === "absent") return c.name + " 불참";
+    if (c.kind === "arrival") return c.name + " 참가 " + c.arrival;
+    if (c.kind === "leave") return c.name + " 일찍 감 " + c.leave;
+    return c.name + " 새로 옴(" + c.gender + " " + c.grade + ", " + c.arrival + "–" + (c.leave || "끝까지") + ")";
+  }
+
+  function changeTexts() { return restChanges().map(changeText); }
+
+  // 3. 미리보기 (계산만, 탐색 없음)
+  function renderRestPreview() {
+    var R = viewBase(), s = R.settings, T = restT();
+    var box = $("rest-preview");
+    clear(box);
+    $("rest-run").disabled = true;
+    if (T === null) { box.appendChild(el("p", { class: "hint", text: "기준 시간을 고르면 남은 경기 수를 계산해 보여 드립니다." })); return; }
+    if (T < 0) { box.appendChild(el("p", { class: "error", text: "아직 시작 전입니다. 새로 만들기를 쓰세요." })); return; }
+    if (T >= R.S - 1) { box.appendChild(el("p", { class: "error", text: "다시 짤 시간대가 없습니다." })); return; }
+    var bad = [];
+    var names = {};
+    R.roster.forEach(function (p) { names[p.name] = true; });
+    state.restForm.newcomers.forEach(function (nc) {
+      if (!nc.name) bad.push("새로 온 사람의 이름을 넣어 주세요");
+      else if (names[nc.name]) bad.push(nc.name + ": 같은 이름이 있습니다. " + nc.name + "(1)처럼 구분해 주세요");
+      else names[nc.name] = true;
+      if (!nc.gender || !nc.grade) bad.push((nc.name || "새로 온 사람") + ": 성별·급수를 골라 주세요");
+    });
+    if (bad.length) { bad.forEach(function (b) { box.appendChild(el("p", { class: "error", text: "⚠ " + b })); }); return; }
+    var pl = Scheduler.restPlan(restBase(), s, T, restChanges(), 0);
+    if (pl.reason === "input") { pl.errors.forEach(function (e) { box.appendChild(el("p", { class: "error", text: "⚠ " + e })); }); return; }
+    var S = R.S, full = s.courts * (S - T - 1);
+    if (!pl.ok) {
+      box.appendChild(el("p", { class: "error", text: pl.reason === "empty" ? "남은 시간에 경기를 할 수 있는 사람이 4명이 안 됩니다." :
+        "남은 경기에서 남자·여자 출전 합을 짝수로 맞출 수 없습니다." }));
+      return;
+    }
+    var rest = pl.loads.slice(T + 1);
+    var items = [
+      ["남은 경기 수", pl.M + "경기 (" + Scheduler.slotTime(s.start, s.minutes, T + 1) + "부터, 최대 " + full + "경기 중 빈 코트 " + (full - pl.M) + "칸)"],
+      ["시간대별", rest.map(function (k, i) { return Scheduler.slotTime(s.start, s.minutes, T + 1 + i) + " " + k; }).join(" / ")]
+    ];
+    var t = el("table", { class: "preview-table" });
+    items.forEach(function (it) { t.appendChild(el("tr", null, [el("th", { text: it[0] }), el("td", { class: "left", text: it[1] })])); });
+    box.appendChild(el("div", { class: "table-wrap" }, [t]));
+    var nt = boundaryNoteText(pl.rb.note, s);
+    if (nt) box.appendChild(el("p", { class: "late-line", text: nt }));
+    var people = pl.roster.map(function (p, i) {
+      return { name: p.name, change: pl.changeOf[p.name] || "same", g0: pl.rp[i].g0, rho: pl.quota.q[i], r: pl.quota.target[i] };
+    });
+    box.appendChild(restTable(people, pl.quota.lambda));
+    var dbl = people.some(function (p, i) { return p.r > Math.ceil(pl.rp[i].mRest / 2) || (pl.rp[i].runAtT >= 1 && pl.rp[i].mRest > 0 && p.r >= pl.rp[i].mRest); });
+    if (dbl || nt) box.appendChild(el("p", { class: "late-line", text: "남은 시간을 채우려면 일부 참가자가 2연속 경기를 합니다." }));
+    box.appendChild(el("p", { class: "hint", text: "실제 대진이 이 값과 다르면 결과 화면에 이유를 보여 드립니다." }));
+    $("rest-run").disabled = !!state.running || !!state.restForm.locked;
+  }
+
+  // 마지막 회차의 바탕(= 그 회차 전 대진)을 결과 모양으로
+  function baseOfLastRound() {
+    var td = todayData();
+    var last = td.rounds[td.rounds.length - 1];
+    return resultFromToday({ date: td.date, settings: td.settings, current: last.before, rounds: td.rounds.slice(0, -1) });
+  }
+
+  // 변동 목록 → 화면 입력 (같은 변동으로 다시 짤 때)
+  function formFromChanges(T, minT, changes) {
+    var F = { T: T, minT: minT, changes: {}, newcomers: [], seed: "" };
+    changes.forEach(function (c) {
+      if (c.kind === "new") F.newcomers.push({ name: c.name, gender: c.gender, grade: c.grade, arrival: c.arrival, leave: c.leave || "" });
+      else F.changes[c.name] = { kind: c.kind, time: c.kind === "arrival" ? c.arrival : c.kind === "leave" ? c.leave : "" };
+    });
+    return F;
+  }
+
+  /*
+   * forceNewSeed: 새 번호. again: {T, changes, replaceLast} — 결과 화면의 "같은 변동, 새 번호로 다시 짜기"(마지막 회차를 그 바탕에서 다시)
+   */
+  function runRest(forceNewSeed, again) {
+    var R = again && again.replaceLast ? baseOfLastRound() : state.result, s = R.settings;
+    var T = again ? again.T : restT();
+    var changes = again ? again.changes : restChanges();
+    var seed = again ? "" : $("rest-seed").value.trim();
+    if (forceNewSeed || !/^\d{6}$/.test(seed)) { do { seed = newSeed(); } while (seed === R.seed || (again && seed === state.result.seed)); }
+    var base = { roster: plainRoster(R.roster), rows: plainRows(R.rows), seed: R.seed };
+    var round = { n: (R.rest ? R.rest.n : 0) + 1, T: T, baseSeed: R.seed, seed: seed, changes: changes };
+    var search = Scheduler.createRestSearch(base, s, T, changes, parseInt(seed, 10));
+    var run = state.running = { cancelled: false };
+    if (again && currentView !== "rest") {
+      state.restForm = formFromChanges(T, R.rest ? R.rest.T : -1, changes);
+      state.restForm.locked = true;    // 바탕이 화면의 결과와 다르므로 이 화면에서 입력을 바꿔 다시 짜지 않는다
+      show("rest");
+      renderRestView(R);
+    }
+    $("rest-fail").hidden = true;
+    $("rest-status").hidden = false;
+    $("rest-run").disabled = true;
+    $("rest-text").textContent = "남은 대진을 찾는 중입니다… (대진 번호 " + seed + ")";
+    $("rest-progress").value = 0;
+
+    function tick() {
+      if (run.cancelled) return finish(null);
+      var st = search.step(STEP_BUDGET_MS);
+      $("rest-progress").value = Math.min(100, Math.max(st.found / Scheduler.SOLUTIONS_TO_COMPARE, st.tries / st.maxTries) * 100);
+      $("rest-text").textContent = "남은 대진을 찾는 중입니다… 남은 " + st.M + "경기로 시도 · 찾은 대진 " + st.found + "/" + Scheduler.SOLUTIONS_TO_COMPARE +
+        "개 · 시도 " + st.tries + "회 (대진 번호 " + seed + ")";
+      if (st.done) finish(search.result());
+      else setTimeout(tick, 0);
+    }
+
+    function finish(res) {
+      state.running = null;
+      $("rest-status").hidden = true;
+      if (!res) { if (!(again && again.replaceLast)) renderRestPreview(); return; }
+      if (!res.ok) {
+        showRestFailure(res, s, { T: T, changes: changes, replaceLast: !!(again && again.replaceLast) });
+        if (!(again && again.replaceLast)) renderRestPreview();
+        return;
+      }
+      var roster = res.roster;
+      var restMeta = {
+        n: round.n, T: T, baseSeed: R.seed, changes: changes, changeOf: res.changeOf,
+        g0: byNameMap(roster, res.rp.map(function (p) { return p.g0; })), H: byNameMap(roster, res.rp.map(function (p) { return p.H; })),
+        rho: byNameMap(roster, res.q), r: byNameMap(roster, res.target), lambda: res.lambda, Mrest: res.M, upper: res.upper, note: res.note,
+        restDoubles: res.totalDoubles, dayDoubles: res.dayDoubles
+      };
+      var meta = { M: res.M, upper: res.upper, ub: res.ub, reductions: res.reductions, repeatOpp: res.repeatOpp, found: res.found, tries: res.tries,
+        q: {}, target: {}, rest: restMeta };
+      var td = todayData() || { format: TODAY_FORMAT, appVersion: Scheduler.SCHEDULER_VERSION, date: s.date,
+        settings: { start: s.start, end: s.end, minutes: s.minutes, courts: s.courts, maxGames: s.maxGames }, current: currentOf(R), rounds: [] };
+      var before = currentOf(R);
+      var history = (R.rest ? R.rest.history : []).concat([{ n: round.n, T: T, baseSeed: R.seed, seed: seed, changes: changes,
+        lambda: res.lambda, Mrest: res.M, version: res.version }]);
+      state.result = makeResult({ settings: s, seed: seed, version: res.version, roster: roster, rows: nameRows(res.matches, roster), meta: meta,
+        rest: { n: round.n, T: T, baseSeed: R.seed, baseRows: base.rows, history: history } });
+      td.current = currentOf(state.result);
+      td.rounds = (again && again.replaceLast ? td.rounds.slice(0, -1) : td.rounds).concat([{ n: round.n, T: T, baseSeed: R.seed, seed: seed, changes: changes,
+        lambda: res.lambda, Mrest: res.M, version: res.version, before: before }]);
+      td.appVersion = Scheduler.SCHEDULER_VERSION;
+      saveToday(td);
+      // ② 명단·대진 번호도 바뀐 명단으로 (낡은 결과 판정이 맞도록)
+      state.roster = roster.map(normalize);
+      $("set-seed").value = seed;
+      state.result.snapshot = currentSnapshot();
+      renderResult();
+      show("result");
+    }
+    setTimeout(tick, 0);
+  }
+
+  function showRestFailure(res, s, again) {
+    var adv = Advice.forRestFailure(res, s);
+    var box = $("rest-fail");
+    clear(box);
+    box.appendChild(el("b", { text: adv.title }));
+    box.appendChild(el("p", { text: adv.intro.text }));
+    if (adv.items.length) {
+      var ul = el("ul");
+      adv.items.forEach(function (it) { ul.appendChild(el("li", { "data-kind": it.kind, text: it.text })); });
+      box.appendChild(ul);
+    }
+    box.setAttribute("data-kinds", adv.kinds.join(","));
+    if (adv.offerNewSeed) {
+      var b = el("button", { type: "button", id: "rest-new-seed", text: "새 번호로 다시 짜기" });
+      b.addEventListener("click", function () { runRest(true, again); });
+      box.appendChild(el("div", { class: "row" }, [b]));
+    }
+    box.hidden = false;
+  }
+
+  // 저장된 오늘 대진 → 결과 (재편성 회차가 있으면 마지막 회차 정보와 함께)
+  function resultFromToday(td) {
+    var s = Object.assign({ date: td.date }, td.settings);
+    var cur = td.current;
+    var last = td.rounds.length ? td.rounds[td.rounds.length - 1] : null;
+    var rest = null;
+    if (last && cur.meta && cur.meta.rest) {
+      rest = { n: last.n, T: last.T, baseSeed: last.baseSeed, baseRows: last.before.rows,
+        history: td.rounds.map(function (r) { return { n: r.n, T: r.T, baseSeed: r.baseSeed, seed: r.seed, changes: r.changes, lambda: r.lambda, Mrest: r.Mrest, version: r.version }; }) };
+    }
+    return makeResult({ settings: s, seed: cur.seed, version: cur.version, roster: cur.roster, rows: cur.rows, meta: cur.meta, rest: rest });
+  }
+
+  function showToday(td) {
+    var s = Object.assign({ date: td.date }, td.settings);
+    state.settings = s;
+    fillSettingsInputs(s);
+    state.roster = td.current.roster.map(normalize);
+    state.replaySeed = "";
+    state.fileNotice = [];
+    $("set-seed").value = td.current.seed;
+    state.result = resultFromToday(td);
+    state.result.snapshot = currentSnapshot();
+    renderResult();
+    show("result");
+  }
+
+  // [재편성 취소]: 마지막 회차의 바탕으로 되돌린다 (plan 2.2)
+  function undoRest() {
+    var td = todayData();
+    if (!td || !td.rounds.length) return;
+    if (!window.confirm("마지막 진행 중 변경(" + td.rounds.length + "회)을 취소하고 그 전 대진으로 돌아갈까요?")) return;
+    var last = td.rounds[td.rounds.length - 1];
+    td.current = last.before;
+    td.rounds = td.rounds.slice(0, -1);
+    saveToday(td);
+    showToday(td);
   }
 
   // ── Excel 저장 (9절) ───────────────────────────────────
@@ -1092,7 +1704,8 @@
 
     // 1) 참가자 명단 — 첫 번째 시트, 1행 머리글 (9절)
     var ws = wb.addWorksheet("참가자 명단", { views: [{ state: "frozen", ySplit: 1 }] });
-    header(ws, ["이름", "성별", "급수", "급수 점수", "참가 시각", "퇴장 시각", "참여 시간대 수", "몫", "배정 경기 수", "2연속 횟수"]);
+    header(ws, ["이름", "성별", "급수", "급수 점수", "참가 시각", "퇴장 시각", "참여 시간대 수", "몫", "배정 경기 수", "2연속 횟수"]
+      .concat(R.rest ? ["변동", "지금까지 경기", "남은 몫", "남은 배정", "하루 합계"] : []));
     R.people.forEach(function (p, i) {
       var r = i + 2;
       put(ws, r, 1, p.name, { text: true });
@@ -1105,8 +1718,15 @@
       put(ws, r, 8, Math.round(p.q * 1000) / 1000);
       put(ws, r, 9, p.games);
       put(ws, r, 10, p.doubles);
+      if (R.rest) {
+        put(ws, r, 11, p.change === "absent-played" ? "불참(지난 경기 있음)" : CHANGE_LABEL[p.change] || "그대로");
+        put(ws, r, 12, p.g0);
+        put(ws, r, 13, Math.round(p.rho * 1000) / 1000);
+        put(ws, r, 14, p.r);
+        put(ws, r, 15, p.g0 + p.r);
+      }
     });
-    widths(ws, [14, 8, 8, 11, 11, 11, 15, 9, 13, 11]);
+    widths(ws, [14, 8, 8, 11, 11, 11, 15, 9, 13, 11].concat(R.rest ? [20, 13, 10, 10, 10] : []));
 
     // 2) 대진표 생성 기준
     ws = wb.addWorksheet("대진표 생성 기준");
@@ -1144,6 +1764,23 @@
       ["규칙", "파트너", "같은 파트너 2회 이상 금지", ""],
       ["규칙", "완화", "없음", "규칙을 모두 지키는 대진만 만든다"]
     ];
+    if (R.rest) {
+      var rm = R.meta.rest, h0 = R.rest.history[0];
+      info.splice(3, 0,
+        ["기록", "재편성 회차", R.rest.n, "진행 중 변경 횟수 (재편성 기록 시트)"],
+        ["기록", "기준 시간대", Scheduler.slotTime(s.start, s.minutes, R.rest.T), "이 시간대까지 진행된 것으로 보고 고정"],
+        ["기록", "바탕 대진 번호", R.rest.baseSeed, "이번 재편성의 바탕 대진"],
+        ["기록", "처음 대진 번호", h0 ? h0.baseSeed : R.rest.baseSeed, "재편성 전 처음 대진 (대진 번호로 다시 볼 수 있음)"],
+        ["계산", "남은 경기 수 M′", R.M, "상한 " + R.upper + (R.M < R.upper ? " (탐색에서 줄임)" : "")],
+        ["계산", "λ (참여 시간대 1칸당 경기 수)", fracText(rm.lambda), "≈ " + fracNum(rm.lambda).toFixed(4) + " · 남은 몫 = λ × 참여 시간대 수 − 지금까지 경기"],
+        ["계산", "남은 2연속 총 횟수", R.totalDoubles, "남은 경기 1 이상인 사람 간 차이 ≤ 1 (ⓗ′). 하루 전체 " + R.dayDoubles + "회"]);
+      info.forEach(function (row) {
+        if (row[1] === "상한") { row[2] = R.upper; row[3] = "남은 시간대의 M′ 상한 (6.8.3: 시간대 " + R.ub.bySlot + ", 3칸 창 " + R.ub.byWindow + ", ⌊ΣH′/4⌋ " + R.ub.byH + " 중 작은 값)"; }
+        if (row[1] === "총 경기 수") row[3] = "하루 전체 = 진행된 " + (R.rows.length - R.M) + "경기 + 남은 " + R.M + "경기";
+        if (row[1] === "1인당 경기 수") row[3] = "하루 합계 = 지금까지 + 남은 배정 (남은 배정은 남은 몫의 내림 또는 올림, 6.8.4)";
+        if (row[1] === "2연속 총 횟수") { row[2] = R.dayDoubles; row[3] = "하루 전체 (참고). 판정은 남은 2연속(ⓗ′)"; }
+      });
+    }
     info.forEach(function (row, i) {
       put(ws, i + 2, 1, row[0]);
       put(ws, i + 2, 2, row[1], { left: true });
@@ -1206,11 +1843,30 @@
       put(ws, r, 6, it.detail, { left: true, wrap: true });
       r++;
     });
-    put(ws, r + 1, 2, "필수 항목(ⓐ~ⓗ) 위반 합계", { bold: true, left: true });
+    put(ws, r + 1, 2, R.rest ? "필수 항목(ⓐ ⓑ ⓒ ⓓ′ ⓔ ⓕ ⓖ ⓗ′ ⓘ) 위반 합계" : "필수 항목(ⓐ~ⓗ) 위반 합계", { bold: true, left: true });
     put(ws, r + 1, 4, R.check.total, { bold: true });
     put(ws, r + 1, 5, R.check.total === 0 ? "통과" : "실패", { bold: true, fill: R.check.total === 0 ? XL.ok : XL.ng });
     put(ws, r + 2, 2, "checker.js(대진 생성 코드와 별도)가 명단과 대진표를 다시 읽어 센 값", { left: true });
     widths(ws, [8, 34, 30, 11, 8, 60]);
+
+    // 6) 재편성 기록 (9절 개정 10): 회차마다 한 줄
+    if (R.rest) {
+      ws = wb.addWorksheet("재편성 기록");
+      header(ws, ["회차", "기준 시간대", "변동", "바탕 대진 번호", "새 대진 번호", "앱 버전", "λ", "λ (소수)", "남은 경기 수 M′"]);
+      R.rest.history.forEach(function (h, i) {
+        var rr = i + 2;
+        put(ws, rr, 1, h.n);
+        put(ws, rr, 2, Scheduler.slotTime(s.start, s.minutes, h.T), { text: true });
+        put(ws, rr, 3, h.changes.length ? h.changes.map(changeText).join(", ") : "변동 없음", { left: true, wrap: true });
+        put(ws, rr, 4, h.baseSeed, { text: true });
+        put(ws, rr, 5, h.seed, { text: true });
+        put(ws, rr, 6, h.version || R.version, { text: true });
+        put(ws, rr, 7, fracText(h.lambda), { text: true });
+        put(ws, rr, 8, h.lambda ? Math.round(fracNum(h.lambda) * 10000) / 10000 : "-");
+        put(ws, rr, 9, h.Mrest);
+      });
+      widths(ws, [6, 12, 60, 14, 14, 10, 10, 10, 14]);
+    }
 
     return wb;
   }
@@ -1233,7 +1889,7 @@
       $("result-error").textContent = "Excel 기능을 불러오지 못했습니다. lib 폴더가 index.html 옆에 있는지 확인해 주세요.";
       return;
     }
-    var name = "대진표_" + R.settings.date.replace(/-/g, "") + "_" + R.seed + ".xlsx";
+    var name = "대진표_" + R.settings.date.replace(/-/g, "") + "_" + R.seed + (R.rest ? "_재편성" + R.rest.n : "") + ".xlsx";
     buildWorkbook(R).xlsx.writeBuffer().then(function (buf) {
       download(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
     }).catch(function (e) {
@@ -1384,8 +2040,59 @@
       if (!rosterStatus().ok) { enterRoster(); return; }               // 명단이 덜 고쳐졌으면 ② 화면에서
       runGenerate(false);
     });
-    $("result-again").addEventListener("click", function () { runGenerate(true); });
+    $("result-again").addEventListener("click", function () {
+      var R = state.result;
+      if (R && R.rest) {
+        var why = restLock();
+        if (why) { $("result-rest-msg").textContent = why; return; }
+        var h = R.rest.history[R.rest.history.length - 1];
+        runRest(true, { T: h.T, changes: h.changes, replaceLast: true });   // 같은 변동, 새 번호 (마지막 회차를 그 바탕에서 다시)
+      } else runGenerate(true);
+    });
     $("result-roster").addEventListener("click", enterRoster);
+
+    // 진행 중 재편성 (8.1)
+    $("home-today").addEventListener("click", function () {
+      var td = loadToday();
+      if (td) { state.today = td; showToday(td); }
+    });
+    $("result-rest").addEventListener("click", enterRest);
+    $("result-undo").addEventListener("click", undoRest);
+    $("rest-T").addEventListener("change", function () {
+      var F = state.restForm;
+      F.T = $("rest-T").value === "" ? "" : Number($("rest-T").value);
+      // 기준이 바뀌면 조건에 안 맞게 된 상태는 그대로로 돌리고, 시각은 새 항목의 첫 값으로
+      var g = playedUntil(restT());
+      var S = viewBase().S, s = viewBase().settings, T = restT();
+      Object.keys(F.changes).forEach(function (n) {
+        var c = F.changes[n];
+        if (T === null || T < 0 || T >= S - 1) return;
+        var first = Scheduler.slotTime(s.start, s.minutes, T + 1);
+        if (c.kind === "arrival" && g[n] > 0) delete F.changes[n];
+        else if ((c.kind === "arrival" || c.kind === "leave") && Scheduler.parseHM(c.time) < Scheduler.parseHM(first)) c.time = first;
+      });
+      F.newcomers.forEach(function (nc) {
+        if (T === null || T < 0 || T >= S - 1) return;
+        var first = Scheduler.slotTime(s.start, s.minutes, T + 1);
+        if (!nc.arrival || Scheduler.parseHM(nc.arrival) < Scheduler.parseHM(first)) nc.arrival = first;
+      });
+      renderRest();
+    });
+    $("rest-add").addEventListener("click", function () {
+      var R = viewBase(), s = R.settings, T = restT();
+      state.restForm.newcomers.push({ name: "", gender: "", grade: "", arrival: Scheduler.slotTime(s.start, s.minutes, T + 1), leave: "" });
+      renderRestPeople();
+      renderRestPreview();
+      var ins = $("rest-body").querySelectorAll("tr.newcomer input");
+      if (ins.length) ins[ins.length - 1].focus();
+    });
+    $("rest-run").addEventListener("click", function () { runRest(false, null); });
+    $("rest-cancel").addEventListener("click", function () { if (state.running) state.running.cancelled = true; });
+    $("rest-back").addEventListener("click", function () {
+      if (state.running) state.running.cancelled = true;
+      restViewBase = null;
+      show("result");
+    });
 
     show("home");
   }
