@@ -14,8 +14,10 @@
   // 2.0.0 (CLAUDE.md 개정 8): 종료 시각·코트 수 입력, 참여 시간 비례 몫, 2연속 허용(3연속 금지), 빈 코트는 뒤로
   // 2.1.0 (CLAUDE.md 개정 10, _work\plan_w7.md): 진행 중 재편성(6.8)만 더함. 재편성이 없는 대진은 2.0.0과 같다
   //   (2.0.0 함수는 그대로 두고, 재편성은 이 파일 끝의 rest* 함수가 따로 한다)
-  var SCHEDULER_VERSION = "2.1.0";
-  var SAME_RULE_VERSIONS = ["2.0.0", "2.1.0"];   // 재편성 없는 대진의 생성 규칙이 같은 버전 (plan_w7 2.7, Q5)
+  // 2.2.0 (CLAUDE.md 개정 11, _work\plan_w7b.md): 코트 채우기 우선 — ①(2.1.0 그대로)에서 못 찾으면 M을 줄이기 전에
+  //   같은 M에서 ⓗ(ⓗ′)를 완화해 ②로 다시 찾는다. ②는 ①의 난수·시도 카운터를 쓰지 않는다(plan_w7b 2.1)
+  var SCHEDULER_VERSION = "2.2.0";
+  var REPLAY_VERSIONS = ["2.0.0", "2.1.0"];      // 경기 수를 줄이지 않은 파일이면 2.2.0에서도 같은 대진 (plan_w7b 3.1)
 
   var GRADE_SCORE = { A: 4, B: 3, C: 2, D: 1, "초심": 0 };   // 6.1
   var MAX_GRADE_DIFF = 1;
@@ -28,6 +30,10 @@
   var MAX_TOTAL_TRIES = 20000;         // 전체 시도 한도 (1.x MAX_RESTARTS와 같음)
   var QUOTA_REDRAW = 250;              // 한 M에서 이만큼 시도해도 못 찾으면 몫 동점 순서를 다시 뽑는다 (W5b 시험 중 결함 수정 1)
   var QUOTA_SALT = 0x85EBCA6B;         // 몫 동점 난수 줄기 (생성 난수와 다름)
+  var RELAX_TRIES_PER_M = 5000;        // plan_w7b 2.2: ② M마다 시도 횟수 (앞 STRICT_TRIES는 사전순 최대 부하 그대로)
+  var MAX_RELAX_TRIES = 20000;         // ② 전체 시도 한도 (① 한도와 따로 센다)
+  var RELAX_SALT = 0x2545F491;         // ② 생성 난수 줄기 (①의 rng와 다름)
+  var RELAX_DRAW_BASE = 1000;          // ② 몫 동점 다시 뽑기 번호 (①의 draw와 겹치지 않게)
 
   // ── 난수 ─────────────────────────────────────────────────
   // mulberry32: 32비트 씨앗값 하나로 [0, 1) 난수를 만드는 작은 생성기
@@ -374,7 +380,7 @@
    * 뽑는 순서: 이번에 안 뛰면 못 채우는 사람 → 직전에 쉰 사람 → 직전에 뛴 사람 중 2연속이 적은 사람 (같은 묶음은 남은 경기 + 난수)
    * fixed(W7): {matches:[{slot,court,t1,t2,type}], fromSlot} — 고정 경기로 기록을 채우고 fromSlot부터 만든다. 2.0.0에서는 빈 값
    */
-  function tryBuild(ctx, target, loads, flexible, rng) {
+  function tryBuild(ctx, target, loads, flexible, rng, relax) {
     var n = ctx.n, S = ctx.S, f = ctx.f, l = ctx.l, sc = ctx.sc, gd = ctx.gd;
     var remaining = target.slice();
     var run = new Array(n).fill(0);
@@ -475,9 +481,10 @@
       actual.push(slotMatches.length);
     }
     for (p = 0; p < n; p++) if (remaining[p]) return null;
-    // ⓗ 2연속 공평: 사람 간 차이 ≤ 1
-    if (Math.max.apply(null, doubles) - Math.min.apply(null, doubles) > 1) return null;
-    return { schedule: schedule, loads: actual, doubles: doubles };
+    // ⓗ 2연속 공평: 사람 간 차이 ≤ 1. relax(② 단계, 2.2.0)면 버리지 않고 차이를 돌려준다
+    var gap = Math.max.apply(null, doubles) - Math.min.apply(null, doubles);
+    if (gap > 1 && !relax) return null;
+    return { schedule: schedule, loads: actual, doubles: doubles, gap: gap };
   }
 
   function repeatOpponentPairs(schedule) {
@@ -502,6 +509,46 @@
     return a.repeatOpp < b.repeatOpp;
   }
 
+  // ② 단계의 해 비교 (6.5 개정 11 우선순위, plan_w7b 2.3): 2연속 차이가 작은 것 → 그다음은 better
+  function betterRelaxed(a, b) {
+    if (a.gap !== b.gap) return a.gap < b.gap;
+    return better(a, b);
+  }
+
+  /*
+   * ② 단계 (plan_w7b 2.1–2.3): ①이 한 M에서 하나도 못 찾았을 때 M을 줄이기 전에 같은 M에서 ⓗ를 완화해 찾는다.
+   * ①의 rng·levelTries·totalTries·draw는 건드리지 않는다 → ②가 못 찾으면 그 뒤는 2.1.0과 같다.
+   * build(target, flexible, rng): 한 번 시도 (relax로 부름), redraw(draw): 그 M의 몫 배정, makeCand(s, quota): 해 기록
+   */
+  function createRelaxStage(seed, M, quota0, build, redraw, makeCand) {
+    var st = { tries: 0, k: 0, found: 0, best: null, quota: quota0,
+      rng: makeRng((seed ^ RELAX_SALT ^ Math.imul(M, 0x9E3779B1)) >>> 0) };
+    // 돌려주는 값: 이번 호출에서 쓴 시도 수. st.done이면 끝
+    st.run = function (until, budgetLeft) {
+      var used = 0;
+      while (!st.done && Date.now() < until) {
+        if (used >= budgetLeft) { st.done = true; break; }
+        if (!st.found && st.tries > 0 && st.tries % QUOTA_REDRAW === 0) {
+          st.k += 1;
+          var qd = redraw(RELAX_DRAW_BASE + st.k);
+          if (qd.ok) st.quota = qd;
+        }
+        st.tries += 1; used += 1;
+        var flexible = st.tries > STRICT_TRIES;
+        var s = build(st.quota.target, flexible, st.rng);
+        if (s) {
+          st.found += 1;
+          var cand = makeCand(s, st.quota, flexible);
+          if (st.best === null || betterRelaxed(cand, st.best)) st.best = cand;
+          if (st.found >= SOLUTIONS_TO_COMPARE) st.done = true;
+        }
+        if (st.tries >= RELAX_TRIES_PER_M) st.done = true;
+      }
+      return used;
+    };
+    return st;
+  }
+
   /*
    * 대진 탐색. 화면이 멈추지 않도록 step(밀리초)을 여러 번 불러 조금씩 진행한다 (나눠 실행해도 결과는 같다).
    * roster: sortRoster로 정렬한 [{name, gender, grade, arrival, leave}]
@@ -523,8 +570,34 @@
     var reductions = pl.parityDrops.map(function (M) { return { from: M, to: M - 1, reason: "parity" }; });
     var state = {
       M: pl.M, quota: pl.quota, loads: pl.loads, levelTries: 0, totalTries: 0, drops: 0, draw: 0,
-      found: 0, best: null, done: pl.M <= 0, failReason: pl.M <= 0 ? pl.reason : null, tried: pl.M > 0 ? [pl.M] : []
+      found: 0, best: null, done: pl.M <= 0, failReason: pl.M <= 0 ? pl.reason : null, tried: pl.M > 0 ? [pl.M] : [],
+      relax: null, relaxTotal: 0, relaxTried: []     // ② 단계 (2.2.0)
     };
+
+    // ①이 이 M에서 못 찾음 → ② (then: "next" = 못 찾으면 M을 줄임, "stop" = 전체 한도라 끝)
+    function enterRelax(then) {
+      var M = state.M;
+      state.relaxTried.push(M);
+      state.relax = createRelaxStage(seed, M, quotas(iv, gd, M, seed, 0),
+        function (target, flexible, r) { return tryBuild(ctx, target, state.loads, flexible, r, true); },
+        function (draw) { return quotas(iv, gd, M, seed, draw); },
+        function (s, quota, flexible) {
+          return { M: M, matches: s.schedule, loads: s.loads, doubles: s.doubles, gap: s.gap,
+            totalDoubles: s.doubles.reduce(function (a, b) { return a + b; }, 0),
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: quota, strict: !flexible, phase: "relax" };
+        });
+      state.relax.then = then;
+    }
+
+    function stepRelax(until) {
+      var rx = state.relax;
+      state.relaxTotal += rx.run(until, MAX_RELAX_TRIES - state.relaxTotal);
+      if (!rx.done) return;
+      state.relax = null;
+      if (rx.best) { state.best = rx.best; state.found = rx.found; state.done = true; return; }
+      if (rx.then === "next") nextLevel();
+      else { state.done = true; state.failReason = "search"; }
+    }
 
     function nextLevel() {
       state.drops += 1;
@@ -549,6 +622,7 @@
     function step(budgetMs) {
       var until = Date.now() + budgetMs;
       while (!state.done && Date.now() < until) {
+        if (state.relax) { stepRelax(until); continue; }
         // 아직 하나도 못 찾았으면 몫 동점(누가 ⌈q⌉를 받는지)을 다시 뽑아 다른 배정으로 시도한다
         if (!state.found && state.levelTries > 0 && state.levelTries % QUOTA_REDRAW === 0) {
           state.draw += 1;
@@ -562,22 +636,23 @@
         if (s) {
           state.found += 1;
           var cand = {
-            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles,
+            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles, gap: s.gap,
             totalDoubles: s.doubles.reduce(function (a, b) { return a + b; }, 0) / 1,
-            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota, strict: !flexible
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota, strict: !flexible, phase: "strict"
           };
           if (state.best === null || better(cand, state.best)) state.best = cand;
           if (state.found >= SOLUTIONS_TO_COMPARE) { state.done = true; break; }
         }
         if (state.levelTries >= TRIES_PER_M) {
           if (state.found > 0) state.done = true;
-          else nextLevel();
+          else enterRelax("next");          // 2.1.0은 여기서 바로 nextLevel()
         } else if (state.totalTries >= MAX_TOTAL_TRIES) {
-          state.done = true;
-          if (!state.found) state.failReason = "search";
+          if (state.found > 0) state.done = true;
+          else enterRelax("stop");          // 2.1.0은 여기서 실패
         }
       }
-      return { done: state.done, tries: state.totalTries, found: state.found, maxTries: MAX_TOTAL_TRIES, M: state.M };
+      return { done: state.done, tries: state.totalTries + state.relaxTotal, found: state.found + (state.relax ? state.relax.found : 0),
+        maxTries: MAX_TOTAL_TRIES + MAX_RELAX_TRIES, M: state.M, relaxing: !!state.relax };
     }
 
     function result() {
@@ -589,6 +664,11 @@
         loads: b ? b.loads : [],
         doubles: b ? b.doubles : [],
         totalDoubles: b ? b.totalDoubles : 0,
+        gap: b ? b.gap : 0,                                        // 2연속 차이 (2.2.0)
+        phase: b ? b.phase : null,                                 // "strict" = ① / "relax" = ②
+        relaxed: !!(b && b.phase === "relax" && b.gap > 1),        // ⓗ를 완화한 대진 (차이 2 이상)
+        relaxTries: state.relaxTotal,
+        relaxTried: state.relaxTried,
         repeatOpp: b ? b.repeatOpp : null,
         q: (b ? b.quota : pl.quota || {}).q || [],
         target: (b ? b.quota : pl.quota || {}).target || [],
@@ -845,7 +925,7 @@
    * 고정 경기로 파트너 기록·직전 연속·하루 2연속을 채우고 T+1부터 만든다. 목표는 남은 배정 rₚ.
    * 2연속은 "남은 2연속"(T·T+1 쌍부터)을 따로 세어 ⓗ′(rₚ ≥ 1인 사람끼리 차이 ≤ 1, Q9)로 판정한다.
    */
-  function tryBuildRest(ctx, target, loads, flexible, rng) {
+  function tryBuildRest(ctx, target, loads, flexible, rng, relax) {
     var n = ctx.n, S = ctx.S, f = ctx.f, l = ctx.l, sc = ctx.sc, gd = ctx.gd, T = ctx.T;
     var remaining = target.slice();
     var run = new Array(n).fill(0);
@@ -942,11 +1022,12 @@
       actual.push(slotMatches.length);
     }
     for (p = 0; p < n; p++) if (remaining[p]) return null;
-    // ⓗ′: 남은 배정이 1 이상인 사람끼리 남은 2연속 차이 ≤ 1 (Q9)
+    // ⓗ′: 남은 배정이 1 이상인 사람끼리 남은 2연속 차이 ≤ 1 (Q9). relax(② 단계, 2.2.0)면 버리지 않고 차이를 돌려준다
     var vals = [];
     for (p = 0; p < n; p++) if (target[p] >= 1) vals.push(restDbl[p]);
-    if (vals.length && Math.max.apply(null, vals) - Math.min.apply(null, vals) > 1) return null;
-    return { schedule: schedule, loads: actual, doubles: doubles, restDoubles: restDbl };
+    var gap = vals.length ? Math.max.apply(null, vals) - Math.min.apply(null, vals) : 0;
+    if (gap > 1 && !relax) return null;
+    return { schedule: schedule, loads: actual, doubles: doubles, restDoubles: restDbl, gap: gap };
   }
 
   /*
@@ -957,7 +1038,8 @@
     var pl = restPlan(base, settings, T, changes, seed);
     var reductions = pl.parityDrops.map(function (M) { return { from: M, to: M - 1, reason: "parity" }; });
     var state = { M: pl.M, quota: pl.quota, loads: pl.loads, levelTries: 0, totalTries: 0, drops: 0, draw: 0,
-      found: 0, best: null, done: !pl.ok, failReason: pl.ok ? null : pl.reason, tried: pl.ok ? [pl.M] : [] };
+      found: 0, best: null, done: !pl.ok, failReason: pl.ok ? null : pl.reason, tried: pl.ok ? [pl.M] : [],
+      relax: null, relaxTotal: 0, relaxTried: [] };   // ② 단계 (2.2.0)
     var ctx = null, gd = null;
     if (pl.ok) {
       var iv = pl.iv;
@@ -968,6 +1050,31 @@
         slotCap: pl.rb.caps.slotCap, fixed: pl.fixed };
     }
     var rng = makeRng(seed);
+
+    // ①이 이 M′에서 못 찾음 → ② (createSearch와 같은 구조)
+    function enterRelax(then) {
+      var M = state.M;
+      state.relaxTried.push(M);
+      state.relax = createRelaxStage(seed, M, restQuotas(pl.rp, gd, M, seed, 0),
+        function (target, flexible, r) { return tryBuildRest(ctx, target, state.loads, flexible, r, true); },
+        function (draw) { return restQuotas(pl.rp, gd, M, seed, draw); },
+        function (s, quota) {
+          return { M: M, matches: s.schedule, loads: s.loads, doubles: s.doubles, restDoubles: s.restDoubles, gap: s.gap,
+            totalDoubles: s.restDoubles.reduce(function (a, b) { return a + b; }, 0),
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: quota, phase: "relax" };
+        });
+      state.relax.then = then;
+    }
+
+    function stepRelax(until) {
+      var rx = state.relax;
+      state.relaxTotal += rx.run(until, MAX_RELAX_TRIES - state.relaxTotal);
+      if (!rx.done) return;
+      state.relax = null;
+      if (rx.best) { state.best = rx.best; state.found = rx.found; state.done = true; return; }
+      if (rx.then === "next") nextLevel();
+      else { state.done = true; state.failReason = "search"; }
+    }
 
     function nextLevel() {
       state.drops += 1;
@@ -991,6 +1098,7 @@
     function step(budgetMs) {
       var until = Date.now() + budgetMs;
       while (!state.done && Date.now() < until) {
+        if (state.relax) { stepRelax(until); continue; }
         if (!state.found && state.levelTries > 0 && state.levelTries % QUOTA_REDRAW === 0) {
           state.draw += 1;
           var qd = restQuotas(pl.rp, gd, state.M, seed, state.draw);
@@ -1003,22 +1111,23 @@
         if (s) {
           state.found += 1;
           var cand = {
-            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles, restDoubles: s.restDoubles,
+            M: state.M, matches: s.schedule, loads: s.loads, doubles: s.doubles, restDoubles: s.restDoubles, gap: s.gap,
             totalDoubles: s.restDoubles.reduce(function (a, b) { return a + b; }, 0),
-            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota
+            repeatOpp: repeatOpponentPairs(s.schedule), quota: state.quota, phase: "strict"
           };
           if (state.best === null || better(cand, state.best)) state.best = cand;
           if (state.found >= SOLUTIONS_TO_COMPARE) { state.done = true; break; }
         }
         if (state.levelTries >= TRIES_PER_M) {
           if (state.found > 0) state.done = true;
-          else nextLevel();
+          else enterRelax("next");          // 2.1.0은 여기서 바로 nextLevel()
         } else if (state.totalTries >= MAX_TOTAL_TRIES) {
-          state.done = true;
-          if (!state.found) state.failReason = "search";
+          if (state.found > 0) state.done = true;
+          else enterRelax("stop");          // 2.1.0은 여기서 실패
         }
       }
-      return { done: state.done, tries: state.totalTries, found: state.found, maxTries: MAX_TOTAL_TRIES, M: state.M };
+      return { done: state.done, tries: state.totalTries + state.relaxTotal, found: state.found + (state.relax ? state.relax.found : 0),
+        maxTries: MAX_TOTAL_TRIES + MAX_RELAX_TRIES, M: state.M, relaxing: !!state.relax };
     }
 
     function result() {
@@ -1040,6 +1149,11 @@
         doubles: b ? b.doubles : [],
         restDoubles: b ? b.restDoubles : [],
         totalDoubles: b ? b.totalDoubles : 0,           // 남은 2연속 총 횟수
+        gap: b ? b.gap : 0,                             // 남은 2연속 차이 (ⓗ′, 2.2.0)
+        phase: b ? b.phase : null,
+        relaxed: !!(b && b.phase === "relax" && b.gap > 1),
+        relaxTries: state.relaxTotal,
+        relaxTried: state.relaxTried,
         dayDoubles: b ? b.doubles.reduce(function (a, c) { return a + c; }, 0) : 0,
         repeatOpp: b ? b.repeatOpp : null,
         q: qt ? qt.q : [],
@@ -1066,6 +1180,18 @@
     return { step: step, result: result, plan: pl };
   }
 
+  /*
+   * 7절 다시 보기 판정 (plan_w7b 3.1): 이 버전의 파일을 같은 번호로 다시 만들면 같은 대진이 나오는가.
+   * 2.0.0·2.1.0 파일은 경기 수를 줄이지 않았을 때(총 경기 수 = 상한)만 같다 — 2.2.0은 ①이 못 찾을 때만 달라지므로.
+   * M·upper를 못 읽으면(숫자 아님) 같다고 하지 않는다
+   */
+  function replaySame(version, M, upper) {
+    if (version === SCHEDULER_VERSION) return true;
+    if (REPLAY_VERSIONS.indexOf(version) < 0) return false;
+    var m = parseInt(M, 10), u = parseInt(upper, 10);
+    return /^\d+$/.test(String(M)) && /^\d+$/.test(String(upper)) && m === u;
+  }
+
   global.Scheduler = {
     SCHEDULER_VERSION: SCHEDULER_VERSION,
     GRADE_SCORE: GRADE_SCORE,
@@ -1089,7 +1215,8 @@
     plan: plan,
     createSearch: createSearch,
     // 2.1.0 재편성
-    SAME_RULE_VERSIONS: SAME_RULE_VERSIONS,
+    REPLAY_VERSIONS: REPLAY_VERSIONS,
+    replaySame: replaySame,
     restRoster: restRoster,
     restPeople: restPeople,
     restBound: restBound,

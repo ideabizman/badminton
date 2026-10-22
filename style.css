@@ -130,6 +130,12 @@ table.grid td.noslot { color: #808080; background: #f2f2f2; font-weight: bold; }
 .check td.pass { background: var(--ok-bg); color: var(--ok); font-weight: bold; }
 .check td.fail { background: var(--ng-bg); color: var(--error); font-weight: bold; }
 .check td.left { text-align: left; }
+.check td.note { background: #fff8e8; color: var(--primary); font-weight: bold; }
+/* 규칙 점검 한 줄 (개정 11, 8절) */
+details.check-all > summary { font-size: 1.02rem; }
+details.check-all > summary b { color: var(--ok); }
+.fail-text { color: var(--error); }
+.rest-none { font-weight: bold; margin: 6px 0; }
 
 table.grid td.match { min-width: 150px; font-size: 0.92rem; line-height: 1.35; }
 table.grid td.t-남복 { background: var(--men); }
@@ -151,12 +157,35 @@ progress { width: 100%; height: 14px; }
 /* 진행 중 재편성 (개정 10, 8.1) */
 .rest-title { margin: 0 0 4px; font-size: 1.15rem; }
 .rest-label { font-weight: bold; margin: 0 0 6px; display: block; }
-#rest-T { min-width: 16em; }
-table.rest td { text-align: left; }
-table.rest td input { min-width: 80px; }
-table.rest tr.changed td, table.rest-people tr.changed td { background: #fff8e8; }
+/* 누름 버튼 줄 (개정 12, 8.1): 기준·이름·카드의 값. 휴대폰 폭에서 넘치면 줄바꿈 */
+.choices { display: flex; flex-wrap: wrap; gap: 4px; }
+button.choice { padding: 5px 9px; min-height: 34px; font-size: 0.92rem; white-space: nowrap; }
+button.choice.on { background: var(--primary); border-color: var(--primary); color: var(--primary-text); font-weight: bold; }
+button.choice:disabled { background: #f2f2f2; color: #b8c0c8; border-color: #e3e7eb; }
+#rest-T .choices { margin: 2px 0 4px; }
+.rest-note { color: var(--warn); }
+table.rest-people tr.changed td { background: #fff8e8; }
+/* 사람 카드 (개정 13, 8.1): 이름 칸 → 이름 버튼 → 카드. 고른 값은 눌린 버튼, 잠긴 줄은 흐린 버튼 */
+button.name-field { display: block; width: 100%; text-align: left; padding: 8px 10px; background: #fff; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+button.name-field[aria-expanded="true"] { border-color: var(--primary); color: var(--primary); }
+.rest-picker { margin: 6px 0; }
+.rest-picker input { width: 100%; margin-bottom: 6px; }
+button.choice.marked { border: 2px solid var(--warn); padding: 4px 8px; }
+button.choice.add { color: var(--primary); border-style: dashed; }
+button.choice.on:disabled { background: #9db3d6; border-color: #9db3d6; color: #fff; }
+.rest-card { border: 2px solid var(--primary); border-radius: 8px; padding: 10px; margin: 8px 0; background: #fff; }
+.rest-card .card-head { font-weight: bold; margin: 0 0 6px; }
+.rest-card .card-head input { min-width: 0; width: 9em; font-weight: bold; }
+.rest-card .card-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 6px 0; }
+.rest-card .card-label { color: var(--muted); font-size: 0.9rem; min-width: 2.6em; }
+.rest-card .card-lock { color: var(--muted); font-size: 0.85rem; }
+.rest-card .rest-short { color: var(--warn); font-size: 0.9rem; font-weight: bold; }
+.rest-card .card-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.rest-changes { list-style: none; margin: 4px 0; padding: 0; }
+.rest-changes li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eef0f2; }
+.rest-changes li button { padding: 4px 10px; white-space: nowrap; }
 table.rest-people { width: auto; }
-.row.tight { margin: 0; gap: 4px; }
+.rest-maybe { color: var(--primary); margin: 6px 0 2px; }
 table.grid tr.fixed th, table.grid tr.fixed td { background: #d9d9d9 !important; color: #6b6b6b; }
 table.grid.mini td.left { text-align: left; font-size: 0.85rem; }
 #mine-list tr.fixed td { background: #ececec; color: #6b6b6b; }

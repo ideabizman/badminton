@@ -185,8 +185,8 @@
     var dvals = names.map(function (n) { return dbl[n]; });
     var dmax = dvals.length ? Math.max.apply(null, dvals) : 0, dmin = dvals.length ? Math.min.apply(null, dvals) : 0;
     var totalD = dvals.reduce(function (s, v) { return s + v; }, 0);
-    items.push({ code: "ⓗ", item: "2연속 횟수의 사람 간 차이 1 이하", rule: "최대 − 최소 ≤ 1",
-      count: dmax - dmin > 1 ? 1 : 0, detail: "총 " + totalD + "회, 최소 " + dmin + "회 · 최대 " + dmax + "회" });
+    items.push(fairItem("ⓗ", "2연속 횟수의 사람 간 차이 1 이하", "최대 − 최소 ≤ 1", dmax - dmin, opts.relaxed,
+      "총 " + totalD + "회, 최소 " + dmin + "회 · 최대 " + dmax + "회"));
 
     // ── 참고 (판정 아님) ──
     var extra = [];
@@ -222,8 +222,22 @@
     extra.push({ code: "참고", item: "2연속 총 횟수 (사람별)", rule: "판정 아님", count: totalD, detail: withD.slice(0, 10).join(", ") + (withD.length > 10 ? " 외 " + (withD.length - 10) + "명" : ""), info: true });
 
     var total = items.reduce(function (s, x) { return s + x.count; }, 0);
-    return { items: items, extra: extra, total: total,
+    return { items: items, extra: extra, total: total, relaxNote: items[7].relaxNote || 0,
       info: { S: S, loads: loads, empty: empty, totalDoubles: totalD, doubles: dbl, games: games, q: q, per: per } };
+  }
+
+  /*
+   * ⓗ·ⓗ′ 판정 (개정 11, plan_w7b 2.4). gap = 2연속 차이(최대 − 최소).
+   * 앱이 "코트를 채우려고 완화"(relaxed)라고 넘겼고 차이가 2 이상이면 위반이 아니라 참고(relaxNote = 차이).
+   * 완화 표시 없이 차이 2 이상이면 위반 (개정 10과 같음). 3연속(ⓑ)은 이 표시와 관계없다
+   */
+  function fairItem(code, item, rule, gap, relaxed, detail) {
+    var it = { code: code, item: item, rule: rule, count: gap > 1 && !relaxed ? 1 : 0, detail: detail, gap: gap };
+    if (gap > 1 && relaxed) {
+      it.relaxNote = gap;
+      it.detail = "참고: 코트를 채우려고 2연속 차이 " + gap + " 허용 · " + detail;
+    }
+    return it;
   }
 
   // ── 재편성 결과 점검 (CLAUDE.md 6.8.5, plan_w7.md 2.11) ─────────────
@@ -339,8 +353,8 @@
     var items = [pick("ⓐ"), pick("ⓑ"), pick("ⓒ"),
       { code: "ⓓ′", item: "남은 경기 수가 남은 몫에 맞음", rule: "⌊ρ⌋ 또는 ⌈ρ⌉ (λ = " + sh.lam.n + "/" + sh.lam.d + ")", count: dv.length, detail: dv.slice(0, SHOW).join(", ") },
       pick("ⓔ"), pick("ⓕ"), pick("ⓖ"),
-      { code: "ⓗ′", item: "남은 시간대 2연속 횟수의 사람 간 차이 1 이하", rule: "최대 − 최소 ≤ 1 (남은 경기 1 이상인 사람)", count: hmax - hmin > 1 ? 1 : 0,
-        detail: "총 " + totalR + "회, 최소 " + hmin + "회 · 최대 " + hmax + "회" },
+      fairItem("ⓗ′", "남은 시간대 2연속 횟수의 사람 간 차이 1 이하", "최대 − 최소 ≤ 1 (남은 경기 1 이상인 사람)", hmax - hmin, opts.relaxed,
+        "총 " + totalR + "회, 최소 " + hmin + "회 · 최대 " + hmax + "회"),
       { code: "ⓘ", item: "진행된 시간대(" + timeOf(0) + "–" + timeOf(T + 1) + ")가 바탕과 같음", rule: "칸마다 같음", count: iv.length, detail: iv.slice(0, SHOW).join(", ") }];
     var extra = all.extra.slice();
     var dayTotal = names.map(function (n) {
@@ -350,7 +364,7 @@
     extra.push({ code: "참고", item: "하루 합계 (지금까지 + 남은 = 합계, λ × 참여 시간대)", rule: "판정 아님", count: rows.length, detail: dayTotal.slice(0, 12).join(", ") + (dayTotal.length > 12 ? " 외 " + (dayTotal.length - 12) + "명" : ""), info: true });
     extra.push({ code: "참고", item: "남은 경기 수 M′", rule: "판정 아님", count: Mrest, detail: "하루 " + rows.length + "경기 중 남은 " + Mrest + "경기", info: true });
     var total = items.reduce(function (s, x) { return s + x.count; }, 0);
-    return { items: items, extra: extra, total: total, rest: true,
+    return { items: items, extra: extra, total: total, rest: true, relaxNote: items[7].relaxNote || 0,
       info: { S: fr.S, loads: all.info.loads, empty: all.info.empty, totalDoubles: all.info.totalDoubles, restDoubles: totalR,
         doubles: all.info.doubles, restDbl: rd, games: all.info.games, restGames: restGames, ppl: ppl, lambda: sh.lam, rho: sh.rho, per: per } };
   }

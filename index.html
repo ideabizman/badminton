@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>배드민턴 대진표 만들기</title>
-  <link rel="stylesheet" href="style.css?v=2026-10-21-w7">
+  <link rel="stylesheet" href="style.css?v=2026-10-22-w7c2">
 </head>
 <body>
   <header class="top">
@@ -184,8 +184,9 @@
       <p class="hint">지금 경기까지는 그대로 두고, 그 뒤 시간을 바뀐 명단에 맞춰 다시 짭니다. 종료 시각·코트 수·경기 시간은 그대로입니다.</p>
       <p class="hint" id="rest-round"></p>
       <div class="box">
-        <label class="rest-label" for="rest-T">1. 기준</label>
-        <select id="rest-T"></select>
+        <p class="rest-label">1. 기준 (지금 하고 있는 경기)</p>
+        <div id="rest-T"></div>
+        <p class="hint" id="rest-T-label"></p>
         <details class="rest-grid-wrap">
           <summary>대진표 보기 (회색 = 진행됨)</summary>
           <div id="rest-grid" class="table-wrap"></div>
@@ -193,14 +194,16 @@
       </div>
       <div class="box">
         <p class="rest-label">2. 바뀐 사람</p>
-        <p class="hint" id="rest-changes-sum"></p>
-        <div class="table-wrap">
-          <table class="rest">
-            <thead><tr><th>이름</th><th>지금까지</th><th>상태</th><th>시각</th><th></th></tr></thead>
-            <tbody id="rest-body"></tbody>
-          </table>
+        <!-- 개정 13: 이름 칸 → 이름 버튼 → 사람 카드. 이름 칸은 버튼(누를 때 키보드를 띄우지 않음), 글자 칸은 이름 버튼 위에 -->
+        <button type="button" id="rest-name" class="name-field" aria-expanded="false">이름을 누르세요 ▾</button>
+        <div id="rest-picker" class="rest-picker" hidden>
+          <input type="text" id="rest-filter" placeholder="글자로 찾기 · 새로 온 사람 이름" aria-label="이름 찾기">
+          <div id="rest-names" class="choices"></div>
         </div>
-        <button type="button" id="rest-add">+ 새로 온 사람</button>
+        <div id="rest-card" class="rest-card" hidden></div>
+        <p class="hint" id="rest-changes-sum"></p>
+        <ul id="rest-changes-list" class="rest-changes"></ul>
+        <p class="hint rest-note" id="rest-changes-note" hidden></p>
       </div>
       <div class="box">
         <p class="rest-label">3. 미리보기</p>
@@ -228,11 +231,11 @@
 
   <!-- 순서대로 불러온다 (file://에서도 동작하도록 모듈을 쓰지 않음)
        ?v= 는 다시 올렸을 때 휴대폰이 옛 파일을 쓰지 않게 하려는 것 (12절). 올릴 때마다 app.js의 UI_BUILD와 같은 날짜로 바꾼다 -->
-  <script src="lib/exceljs.min.js?v=2026-10-21-w7"></script>
-  <script src="scheduler.js?v=2026-10-21-w7"></script>
-  <script src="checker.js?v=2026-10-21-w7"></script>
-  <script src="advice.js?v=2026-10-21-w7"></script>
-  <script src="image.js?v=2026-10-21-w7"></script>
-  <script src="app.js?v=2026-10-21-w7"></script>
+  <script src="lib/exceljs.min.js?v=2026-10-22-w7c2"></script>
+  <script src="scheduler.js?v=2026-10-22-w7c2"></script>
+  <script src="checker.js?v=2026-10-22-w7c2"></script>
+  <script src="advice.js?v=2026-10-22-w7c2"></script>
+  <script src="image.js?v=2026-10-22-w7c2"></script>
+  <script src="app.js?v=2026-10-22-w7c2"></script>
 </body>
 </html>
